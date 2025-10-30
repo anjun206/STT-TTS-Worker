@@ -81,17 +81,6 @@ Invoke-RestMethod -Uri http://localhost:8000/dub -Method Post -Form @{
 
 응답에는 `job_id`가 포함됩니다. `./data/<job_id>/output.mp4`를 확인하거나 `GET /download/{job_id}`를 호출해 최종(믹스된) 영상을 내려받을 수 있습니다.
 
-## 보이스 샘플 유틸리티
-
-* 아무 미디어 파일이나 `POST /voice-sample`로 보내면 6초짜리 레퍼런스 클립을 생성해 `./data/<job_id>/voice_sample_24k.wav`에 저장합니다.
-* `/dub`, `/tts-probe`, `/tts-single`과 함께 재사용할 레퍼런스 보이스를 만들 때 유용합니다.
-
-```powershell
-Invoke-WebRequest -Uri http://localhost:8000/voice-sample -Method Post -Form @{
-  file = Get-Item .\sample.mp4
-} -OutFile voice_sample.wav
-```
-
 ## 스토리지 레이아웃
 
 * `./data`: 작업 단위(job)별 워크스페이스(입력, 중간 산출물, 최종 렌더)를 두 컨테이너가 공유.
