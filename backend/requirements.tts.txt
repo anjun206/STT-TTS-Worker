@@ -1,0 +1,13 @@
+# TTS worker requirements
+fastapi==0.115.0  # FastAPI 앱 엔드포인트 정의용
+uvicorn[standard]==0.30.6  # FastAPI를 ASGI 서버로 띄우는 실행기
+python-multipart==0.0.9  # 업로드된 WAV 등 multipart/form-data 파싱
+
+TTS==0.22.0  # Coqui XTTS 모델 로딩·합성 핵심 라이브러리
+soundfile==0.12.1  # 합성 결과 WAV 입출력 처리
+requests==2.32.3  # 외부 TTS_URL로 프록시 호출할 때 사용 가능
+faster-whisper==1.0.3  # pipeline.py import 충족용 Whisper 모델 래퍼
+transformers==4.44.2  # XTTS 내부가 의존하는 Hugging Face 모델 로더
+sentencepiece==0.2.0  # Transformers의 SentencePiece 토크나이저 지원
+huggingface_hub==0.24.6  # Hugging Face 모델 캐시 및 다운로드 API
+torchcodec  # torchaudio가 XTTS 참고 음성 로드 시 요구하는 디코더
