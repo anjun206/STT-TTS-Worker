@@ -1,0 +1,22 @@
+# API/ASR container requirements
+fastapi==0.115.0  # HTTP 라우팅 및 API 정의
+uvicorn[standard]==0.30.6  # FastAPI 실행용 ASGI 서버
+python-multipart==0.0.9  # 업로드된 미디어 파일 multipart 처리
+
+faster-whisper==1.0.3  # Whisper 기반 ASR 수행
+onnxruntime-gpu==1.19.0  # 번역·음성처리용 ONNX 모델 GPU 추론
+
+transformers==4.44.2  # 번역/언어모델 로딩
+sentencepiece==0.2.0  # Transformers SentencePiece 토크나이저 지원
+huggingface_hub==0.24.6  # Hugging Face 모델 다운로드/캐시
+
+soundfile==0.12.1  # WAV 입출력 처리
+sacremoses==0.0.53  # 텍스트 토큰화·정규화 (Moses 기반)
+cutlet==0.4.0  # 일본어 로마자 변환 도우미
+fugashi==1.3.2  # 일본어 형태소 분석기 (MeCab 래퍼)
+unidic-lite==1.0.8  # fugashi용 경량 일본어 사전
+demucs==4.0.0  # BGM/보컬 분리를 위한 소스 분리 모델 (python -m demucs.separate)
+
+requests==2.32.3  # 외부 서비스 호출 및 HTTP 편의
+webrtcvad==2.0.10  # 음성 활동 감지 (VAD) 계산
+torchcodec  # torchaudio 기반 로더가 필요 시 참조하는 디코더

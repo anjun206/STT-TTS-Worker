@@ -1,0 +1,47 @@
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    TORCH_CUDA_ARCH_LIST="12.0+PTX"
+
+# TTS 워커에서 공통으로 사용하는 기본 시스템 패키지 설치
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    build-essential git git-lfs curl ca-certificates \
+    ffmpeg sox libsndfile1 libsndfile1-dev \
+    libgl1 libglib2.0-0 ninja-build cmake pkg-config wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# deadsnakes PPA를 통해 Python 3.11 설치
+RUN add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-venv python3.11-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# TTS 실행 환경을 위한 가상환경 생성
+RUN python3.11 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# pip 도구 업그레이드 및 CUDA 버전의 Torch 설치
+RUN python -m ensurepip && python -m pip install --upgrade pip setuptools wheel
+RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
+    torch torchvision torchaudio
+
+WORKDIR /app
+COPY backend/requirements.tts.txt /app/requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt
+
+COPY backend/app /app/app
+
+ENV HF_HOME=/app/cache/hf \
+    TRANSFORMERS_CACHE=/app/cache/hf \
+    HUGGINGFACE_HUB_CACHE=/app/cache/hf \
+    TTS_HOME=/app/cache/tts \
+    COQUI_TOS_AGREED=1
+
+RUN useradd -m appuser && mkdir -p /app/cache/hf /app/cache/tts && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 9000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000"]
