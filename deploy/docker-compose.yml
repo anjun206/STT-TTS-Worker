@@ -38,7 +38,7 @@ services:
       - ./data/hf_cache:/app/cache/hf
       - ./data/tts_cache:/app/cache/tts
       - ./data/demucs_cache:/app/cache/demucs
-      - ./backend/app:/app/app
+      - ../backend/app:/app/app
     ports:
       - "8000:8000"
     shm_size: "2gb"
@@ -70,7 +70,7 @@ services:
       - ./data:/app/data
       - ./data/tts_cache:/app/cache/tts
       - ./data/hf_cache:/app/cache/hf
-      - ./backend/app:/app/app
+      - ../backend/app:/app/app
     ports:
       - "9000:9000"
     shm_size: "2gb"
