@@ -1,5 +1,6 @@
 services:
   api:
+    profiles: [ "full" ]
     # API/ASR 워커: 합성 요청을 전용 TTS 서비스로 전달
     build:
       context: ..
@@ -18,7 +19,7 @@ services:
       MT_MAX_BATCH_SIZE: "16"
       MT_FP16: "1"
       # Whisper 관련 설정
-      WHISPER_MODEL: large-v3
+      WHISPER_MODEL: tiny
       WHISPER_BATCH_SIZE: "8"
       WHISPER_LANG: ko
       # 원격 TTS 엔드포인트; 중복 로딩을 막기 위해 로컬 TTS는 CPU로 유지
@@ -38,40 +39,56 @@ services:
       - ./data/hf_cache:/app/cache/hf
       - ./data/tts_cache:/app/cache/tts
       - ./data/demucs_cache:/app/cache/demucs
-      - ./backend/app:/app/app
+      - ../backend/app:/app/app
     ports:
       - "8000:8000"
     shm_size: "2gb"
-    depends_on:
-      - tts  # API 트래픽을 받기 전에 TTS가 기동되도록 보장
+    # depends_on:
+    #   - tts # API 트래픽을 받기 전에 TTS가 기동되도록 보장
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # tts:
+    #   profiles: ["full"]
+    #   # XTTS v2 워커: /tts-single 엔드포인트로 합성 제공
+    #   build:
+    #     context: ..
+    #     dockerfile: backend/Dockerfile.tts
+    #   container_name: stt-tts-tts
+    #   gpus: all
+    #   environment:
+    #     # XTTS 추론에 CUDA 사용
+    #     USE_GPU: "0"
+    #     TTS_DEVICE: "cuda"
+    #     TTS_MODEL: "tts_models/multilingual/multi-dataset/xtts_v2"
+    #     COQUI_TOS_AGREED: "1"
+    #     # 호스트 볼륨과 일치하는 캐시 경로
+    #     HF_HOME: /app/cache/hf
+    #     TRANSFORMERS_CACHE: /app/cache/hf
+    #     HUGGINGFACE_HUB_CACHE: /app/cache/hf
+    #     TTS_HOME: /app/cache/tts
+    #     NVIDIA_VISIBLE_DEVICES: "all"
+    #     NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    #   volumes:
+    #     - ./data:/app/data
+    #     - ./data/tts_cache:/app/cache/tts
+    #     - ./data/hf_cache:/app/cache/hf
+    #     - ../backend/app:/app/app
+    #   ports:
+    #     - "9000:9000"
+    #   shm_size: "2gb"
+    # command: uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
 
-  tts:
-    # XTTS v2 워커: /tts-single 엔드포인트로 합성 제공
+  worker:
     build:
       context: ..
-      dockerfile: backend/Dockerfile.tts
-    container_name: stt-tts-tts
-    gpus: all
+      dockerfile: backend/Dockerfile.worker
+    container_name: stt-tts-worker
     environment:
-      # XTTS 추론에 CUDA 사용
-      USE_GPU: "1"
-      TTS_DEVICE: "cuda"
-      TTS_MODEL: "tts_models/multilingual/multi-dataset/xtts_v2"
-      COQUI_TOS_AGREED: "1"
-      # 호스트 볼륨과 일치하는 캐시 경로
-      HF_HOME: /app/cache/hf
-      TRANSFORMERS_CACHE: /app/cache/hf
-      HUGGINGFACE_HUB_CACHE: /app/cache/hf
-      TTS_HOME: /app/cache/tts
-      NVIDIA_VISIBLE_DEVICES: "all"
-      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-    volumes:
-      - ./data:/app/data
-      - ./data/tts_cache:/app/cache/tts
-      - ./data/hf_cache:/app/cache/hf
-      - ./backend/app:/app/app
-    ports:
-      - "9000:9000"
-    shm_size: "2gb"
-    command: uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
+      # 빠른 테스트용 CPU/소형 모델 권장
+      USE_GPU: "0"
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      AWS_REGION: ${AWS_REGION}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL}
+      S3_BUCKET: ${S3_BUCKET}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    command: python -m app.worker_stt
