@@ -180,7 +180,7 @@ def build_output_keys(msg_body: dict, detected_lang: str, subtitle_fmt: str) -> 
     """
     # outputs/{targetLang}/subtitles/{assetId}.srt + manifests/{assetId}.json
     project_id = _get_project_id(msg_body)
-    target_lang = (msg_body.get("targetLang") or msg_body.get("target_lang") or detected_lang or "und").lower()
+    target_lang = (msg_body.get("targetLang") or msg_body.get("target_lang") or detected_lang or "und")
     asset_id = msg_body.get("assetId") or msg_body.get("asset_id") or msg_body.get("uploadId") or str(uuid.uuid4())
     # _get_project_id에서 검증됨
     sub_ext = "vtt" if subtitle_fmt.lower() == "vtt" else "srt"
