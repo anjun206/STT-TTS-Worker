@@ -20,3 +20,4 @@ demucs==4.0.0  # BGM/보컬 분리를 위한 소스 분리 모델 (python -m dem
 requests==2.32.3  # 외부 서비스 호출 및 HTTP 편의
 webrtcvad==2.0.10  # 음성 활동 감지 (VAD) 계산
 torchcodec  # torchaudio 기반 로더가 필요 시 참조하는 디코더
+boto3==1.35.5
