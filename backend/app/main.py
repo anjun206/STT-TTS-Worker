@@ -37,6 +37,17 @@ from .pipeline import (
     build_voice_sample_stage, synthesize_single_text,
 )
 from .utils_meta import load_meta, save_meta
+from .aws_worker import start_background_worker, stop_background_worker
+
+
+@app.on_event("startup")
+async def _aws_worker_startup():
+    start_background_worker()
+
+
+@app.on_event("shutdown")
+async def _aws_worker_shutdown():
+    stop_background_worker()
 
 # ---------- 바디 모델 (PATCH는 사용 안 해도 OK) ----------
 class SegmentPatch(BaseModel):
