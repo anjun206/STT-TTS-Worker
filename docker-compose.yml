@@ -1,0 +1,44 @@
+services:
+  dub:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ai-dub
+    gpus: all
+    env_file:
+      - ../backend/.env
+    environment:
+      SEPARATE_BGM: "1"
+      USE_GPU: "1"
+      TTS_DEVICE: "cuda"
+      MT_DEVICE: "cuda" # ✅ 번역도 GPU
+      MT_FAST_ONLY: "1" # 1=빠른 모델만, 0=무거운 백업까지 허용
+      MT_NUM_BEAMS: "1" # 1(추천). 품질↑ 원하면 2~3
+      MT_MAX_NEW_TOKENS: "96" # 문장 길면 128~160
+      MT_MAX_BATCH_TOKENS: "2048"
+      MT_MAX_BATCH_SIZE: "16"
+      MT_FP16: "1" # ✅ (선택) fp16 시도
+      COQUI_TOS_AGREED: "1"
+      HF_HOME: /app/cache/hf
+      TRANSFORMERS_CACHE: /app/cache/hf
+      HUGGINGFACE_HUB_CACHE: /app/cache/hf
+      DEMUCS_CACHE: /app/cache/demucs
+      TTS_HOME: /app/cache/tts
+      WHISPER_BACKEND: whisperx # <- 코드상 실제 사용은 faster_whisper이므로 참고값
+      WHISPER_MODEL: large-v3
+      WHISPER_BATCH_SIZE: "8"
+      WHISPERX_ALIGN: "1"
+      WHISPER_LANG: ko
+      TTS_MODEL: "tts_models/multilingual/multi-dataset/xtts_v2"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      AWS_PROFILE: dev
+    volumes:
+      - ./data:/app/data
+      - ./data/hf_cache:/app/cache/hf
+      - ./data/tts_cache:/app/cache/tts
+      - ./data/demucs_cache:/app/cache/demucs
+      - ./backend/app:/app/app
+      - //c/Users/malss/.aws:/home/appuser/.aws:ro
+    shm_size: "2gb"
+    command: python -m app.worker
