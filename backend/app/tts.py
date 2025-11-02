@@ -4,7 +4,6 @@ from functools import lru_cache
 
 LANG_MAP = {"en": "en", "ja": "ja", "ko": "ko"}
 TTS_DEVICE = os.getenv("TTS_DEVICE", "cpu").lower()
-TTS_URL = os.getenv("TTS_URL")  # Remote TTS endpoint (e.g. http://tts:9000)
 
 def _prepare_torch_deserialization():
     """
@@ -62,21 +61,6 @@ def _get_tts(model_name: str):
     return tts
 
 def synthesize(text: str, ref_wav: str, language: str, out_path: str, model_name: str):
-    # Prefer remote synthesis when TTS_URL is configured.
-    if TTS_URL:
-        import requests
-
-        url = TTS_URL.rstrip("/") + "/tts-single"
-        with open(ref_wav, "rb") as f:
-            files = {"ref_voice": ("ref.wav", f, "audio/wav")}
-            data = {"text": text, "target_lang": language}
-            response = requests.post(url, files=files, data=data, timeout=600)
-
-        response.raise_for_status()
-        with open(out_path, "wb") as wf:
-            wf.write(response.content)
-        return
-
     tts = _get_tts(model_name)
     lang = LANG_MAP.get(language, "en")
     tts.tts_to_file(text=text, speaker_wav=ref_wav, language=lang, file_path=out_path)

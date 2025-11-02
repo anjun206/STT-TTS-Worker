@@ -1,39 +1,44 @@
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    TORCH_CUDA_ARCH_LIST="12.0+PTX"
+    PYTHONUNBUFFERED=1
 
-# API 컨테이너에서 공통으로 사용하는 기본 시스템 패키지 설치
+# 필수 패키지
 RUN apt-get update && apt-get install -y --no-install-recommends \
     software-properties-common \
     build-essential git git-lfs curl ca-certificates \
     ffmpeg sox libsndfile1 libsndfile1-dev \
-    libgl1 libglib2.0-0 ninja-build cmake pkg-config wget \
- && rm -rf /var/lib/apt/lists/*
+    libgl1 libglib2.0-0 \
+    ninja-build cmake pkg-config \
+    wget \
+&& rm -rf /var/lib/apt/lists/*
 
-# deadsnakes PPA를 통해 Python 3.11 설치
+# Python 3.11 (deadsnakes)
 RUN add-apt-repository ppa:deadsnakes/ppa -y && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3.11 python3.11-venv python3.11-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# 애플리케이션 의존성을 위한 가상환경 생성
+# 전용 가상환경 생성 및 활성 경로 설정
 RUN python3.11 -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# pip 도구 업그레이드 및 CUDA 버전의 Torch 설치
+# pip 최신화
 RUN python -m ensurepip && python -m pip install --upgrade pip setuptools wheel
+
+# ✅ cu128 PyTorch 계열 (가상환경에 설치)
+ENV TORCH_CUDA_ARCH_LIST="12.0+PTX"
 RUN python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 \
     torch torchvision torchaudio
 
 WORKDIR /app
-COPY backend/requirements.api.txt /app/requirements.txt
+COPY requirements.txt /app/requirements.txt
+
+# 나머지 파이썬 패키지 (모두 가상환경에)
 RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 
-# 실제 실행 시 /app/app 경로로 애플리케이션 코드가 마운트된다고 가정
-COPY backend/app /app/app
+COPY app /app/app
 
 ENV HF_HOME=/app/cache/hf \
     TRANSFORMERS_CACHE=/app/cache/hf \

@@ -6,18 +6,34 @@ import shutil
 import shlex
 from typing import Optional, List, Dict
 
+from faster_whisper import WhisperModel
 from fastapi import UploadFile
 
+from .translate import translate_texts
 from .tts import synthesize
 from .utils import (
-    run, ffprobe_duration, make_silence, time_stretch,
-    trim_or_pad_to_duration, concat_audio, replace_audio_in_video,
-    split_audio_by_targets, separate_bgm_vocals, mix_bgm_with_tts,
-    extract_audio_full,mask_keep_intervals, mix_bgm_fx_with_tts,
+    run,
+    ffprobe_duration,
+    make_silence,
+    time_stretch,
+    trim_or_pad_to_duration,
+    concat_audio,
+    replace_audio_in_video,
+    split_audio_by_targets,
+    separate_bgm_vocals,
+    mix_bgm_with_tts,
+    extract_audio_full,
+    mask_keep_intervals,
+    mix_bgm_fx_with_tts,
     cut_wav_segment,
 )
 from .utils_meta import load_meta, save_meta
-from .vad import compute_vad_silences, sum_silence_between, complement_intervals, merge_intervals
+from .vad import (
+    compute_vad_silences,
+    sum_silence_between,
+    complement_intervals,
+    merge_intervals,
+)
 
 from typing import Tuple
 
@@ -28,13 +44,27 @@ USE_GPU = os.getenv("USE_GPU", "1") == "1"
 _device = "cuda" if USE_GPU else "cpu"
 _compute = "float16" if _device == "cuda" else "int8"
 
-_whisper_model = None  # Lazily populated when ASR is requested
-
 EPS = 0.02  # 20ms 허용오차
+
 
 # ----------------- 공통 유틸 -----------------
 def _ensure_dir(p):
     os.makedirs(p, exist_ok=True)
+
+
+def _annotate_segments(segments: List[Dict]) -> List[Dict]:
+    """
+    Ensure downstream metadata consumers receive normalized segment fields.
+    """
+    for idx, seg in enumerate(segments):
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        seg["seg_id"] = seg.get("seg_id", idx)
+        seg["length"] = max(0.0, end - start)
+        seg.setdefault("issues", [])
+        seg.setdefault("score", None)
+    return segments
+
 
 def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
     """
@@ -45,34 +75,38 @@ def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
     extract_audio_full(in_path, full_48k)
 
     vocals_48k = os.path.join(work, "vocals_48k.wav")
-    bgm_48k    = os.path.join(work, "bgm_48k.wav")
+    bgm_48k = os.path.join(work, "bgm_48k.wav")
     if os.getenv("SEPARATE_BGM", "1") == "1":
         separate_bgm_vocals(full_48k, vocals_48k, bgm_48k)
     else:
-        run(f"ffmpeg -y -i {shlex.quote(full_48k)} -ar 48000 -ac 2 {shlex.quote(vocals_48k)}")
-        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(full_48k):.3f} {shlex.quote(bgm_48k)}")
+        run(
+            f"ffmpeg -y -i {shlex.quote(full_48k)} -ar 48000 -ac 2 {shlex.quote(vocals_48k)}"
+        )
+        run(
+            f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(full_48k):.3f} {shlex.quote(bgm_48k)}"
+        )
 
     vocals_16k_raw = os.path.join(work, "vocals_16k_raw.wav")
-    run(f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(vocals_16k_raw)}")
+    run(
+        f"ffmpeg -y -i {shlex.quote(vocals_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(vocals_16k_raw)}"
+    )
     return full_48k, vocals_48k, bgm_48k, vocals_16k_raw
+
 
 def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
     # 6초 참조 (24k mono)
     run(f"ffmpeg -y -i {audio_wav_16k} -t 6 -ar 24000 -ac 1 {out_ref_24k}")
 
+
 def _whisper_transcribe(audio_wav_16k: str):
-    global _whisper_model
-    if _whisper_model is None:
-        try:
-            from faster_whisper import WhisperModel  # type: ignore
-        except ImportError as e:
-            raise RuntimeError(
-                "ASR requested but faster-whisper is not installed in this environment."
-            ) from e
-        _whisper_model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
-    model = _whisper_model
-    segments, info = model.transcribe(audio_wav_16k, language=None, vad_filter=True, word_timestamps=False)
-    return [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segments]
+    model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
+    segments, info = model.transcribe(
+        audio_wav_16k, language=None, vad_filter=True, word_timestamps=False
+    )
+    return [
+        {"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
+        for s in segments
+    ]
 
 
 def _ensure_ref_voice(work: str, wav_16k: str, ref_voice: Optional[UploadFile]) -> str:
@@ -83,6 +117,7 @@ def _ensure_ref_voice(work: str, wav_16k: str, ref_voice: Optional[UploadFile]) 
         return ref_path
     _pick_ref(wav_16k, ref_path)
     return ref_path
+
 
 def synthesize_single_text(
     text: str,
@@ -117,38 +152,38 @@ def synthesize_single_text(
         shutil.copyfileobj(ref_voice.file, f)
 
     out_path = os.path.join(workdir, "tts.wav")
-    synthesize(text, raw_ref, language=target_lang, out_path=out_path, model_name=TTS_MODEL)
-    return {"job_id": job_id, "workdir": workdir, "tts_wav": out_path, "ref_wav": raw_ref}
+    synthesize(
+        text, raw_ref, language=target_lang, out_path=out_path, model_name=TTS_MODEL
+    )
+    return {
+        "job_id": job_id,
+        "workdir": workdir,
+        "tts_wav": out_path,
+        "ref_wav": raw_ref,
+    }
 
-
-
-def _translate_texts_safe(texts: List[str], src: str, tgt: str) -> List[str]:
-    try:
-        from .translate import translate_texts  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "Translation dependencies are missing; install transformers stack to use this endpoint."
-        ) from e
-    return translate_texts(texts, src=src, tgt=tgt)
 
 # ----------------- 번역 (자동 수정 없음) -----------------
-def translate_stage(segments: List[Dict], src: str, tgt: str, length_mode: str = "off") -> List[Dict]:
+def translate_stage(
+    segments: List[Dict], src: str, tgt: str, length_mode: str = "off"
+) -> List[Dict]:
     """
-    �ڵ� ���� ����/���� ���� ����.
-    �Է� ���׸�Ʈ�� ������ǥ(start,end)�� �״�� ������ ���� �ؽ�Ʈ�� ä��.
-    ��ȯ: [{"start": float, "end": float, "text": str}, ...]
+    자동 길이 조정/문자 수정 없음.
+    입력 세그먼트의 절대좌표(start,end)를 그대로 복사해 번역 텍스트만 채움.
+    반환: [{"start": float, "end": float, "text": str}, ...]
     """
     texts = [s["text"] for s in segments]
-    base = _translate_texts_safe(texts, src=src, tgt=tgt)
+    base = translate_texts(texts, src=src, tgt=tgt)
     outs: List[Dict] = []
     for s, t in zip(segments, base):
         outs.append({"start": s["start"], "end": s["end"], "text": t})
     return outs
 
 
-
 # ----------------- 1차 TTS: 길이 측정(Probe) -----------------
-async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[UploadFile]):
+async def tts_probe_stage(
+    job_id: str, target_lang: str, ref_voice: Optional[UploadFile]
+):
     """
     세그먼트별로 TTS를 '원문 그대로' 합성하여 실제 길이를 측정하고,
     slot(=end-start)과 비교해 over/less/fit 및 초 차이(delta)를 기록.
@@ -165,11 +200,14 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
 
     report = []
     for i, tr in enumerate(trs):
-        start = float(tr["start"]); end = float(tr["end"])
+        start = float(tr["start"])
+        end = float(tr["end"])
         slot = max(0.05, end - start)
 
         raw = os.path.join(work, f"probe_{i:04d}_raw.wav")
-        synthesize(tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL)
+        synthesize(
+            tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL
+        )
         raw_dur = ffprobe_duration(raw)
 
         delta = raw_dur - slot
@@ -180,22 +218,27 @@ async def tts_probe_stage(job_id: str, target_lang: str, ref_voice: Optional[Upl
         else:
             status = "fit"
 
-        report.append({
-            "i": i,
-            "start": start,
-            "end": end,
-            "slot_dur": slot,
-            "raw_dur": raw_dur,
-            "delta": delta,
-            "status": status
-        })
+        report.append(
+            {
+                "i": i,
+                "start": start,
+                "end": end,
+                "slot_dur": slot,
+                "raw_dur": raw_dur,
+                "delta": delta,
+                "status": status,
+            }
+        )
 
     meta["duration_report"] = report
     save_meta(work, meta)
     return {"workdir": work, "duration_report": report}
 
+
 # ----------------- 2차 TTS: 최종 보정/결합(Finalize) -----------------
-async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[UploadFile]):
+async def tts_finalize_stage(
+    job_id: str, target_lang: str, ref_voice: Optional[UploadFile]
+):
     assert target_lang in ("en", "ja", "ko")
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
@@ -212,7 +255,7 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     right_gaps: List[float] = []
     for i in range(len(trs)):
         if i < len(trs) - 1:
-            rg = max(0.0, float(trs[i+1]["start"]) - float(trs[i]["end"]))
+            rg = max(0.0, float(trs[i + 1]["start"]) - float(trs[i]["end"]))
         else:
             rg = 0.0
         right_gaps.append(rg)
@@ -225,7 +268,8 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
         parts.append(lead_wav)
 
     for i, tr in enumerate(trs):
-        start = float(tr["start"]); end = float(tr["end"])
+        start = float(tr["start"])
+        end = float(tr["end"])
         slot = max(0.05, end - start)
 
         # 외부 갭(세그 i와 i+1 사이)에 실제로 삽입할 길이(빌림 적용 후)
@@ -236,29 +280,55 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
         if lay and len(lay.get("slots", [])) > 1:
             # 🔹 머지된 세그먼트: 텍스트 1번 합성 → 원본 슬롯 길이에 따라 '스마트 컷'
             raw_all = os.path.join(work, f"final_{i:04d}_raw_all.wav")
-            synthesize(tr["text"], ref, language=target_lang, out_path=raw_all, model_name=TTS_MODEL)
-            slot_durs = [max(0.05, float(s["end"]) - float(s["start"])) for s in lay["slots"]]
+            synthesize(
+                tr["text"],
+                ref,
+                language=target_lang,
+                out_path=raw_all,
+                model_name=TTS_MODEL,
+            )
+            slot_durs = [
+                max(0.05, float(s["end"]) - float(s["start"])) for s in lay["slots"]
+            ]
             inner_gaps = [max(0.0, float(g)) for g in lay.get("gaps", [])]
 
             # 무음 스냅 컷
             chunks = split_audio_by_targets(raw_all, slot_durs, work, f"final_{i:04d}")
             # 각 슬롯별 규칙 적용(오버=배속, 레스=패드)
             for j, ch in enumerate(chunks):
-                ch_dur = ffprobe_duration(ch); tgt = slot_durs[j]
+                ch_dur = ffprobe_duration(ch)
+                tgt = slot_durs[j]
                 outp = os.path.join(work, f"final_{i:04d}_slot_{j:02d}.wav")
                 if ch_dur > tgt + EPS:
                     tempo = ch_dur / tgt
                     tmp = outp.replace(".wav", "_tempo.wav")
                     time_stretch(ch, tmp, tempo=tempo, ar=24000)
                     info = trim_or_pad_to_duration(tmp, outp, tgt, ar=24000)
-                    final_report.append({"i": i, "sub": j, "mode": "speedup",
-                                         "tempo": tempo, "raw_dur": ch_dur,
-                                         "slot_dur": tgt, "padded": info["padded"], "trimmed": info["trimmed"]})
+                    final_report.append(
+                        {
+                            "i": i,
+                            "sub": j,
+                            "mode": "speedup",
+                            "tempo": tempo,
+                            "raw_dur": ch_dur,
+                            "slot_dur": tgt,
+                            "padded": info["padded"],
+                            "trimmed": info["trimmed"],
+                        }
+                    )
                 else:
                     info = trim_or_pad_to_duration(ch, outp, tgt, ar=24000)
-                    final_report.append({"i": i, "sub": j, "mode": "pad",
-                                         "raw_dur": ch_dur, "slot_dur": tgt,
-                                         "padded": info["padded"], "trimmed": info["trimmed"]})
+                    final_report.append(
+                        {
+                            "i": i,
+                            "sub": j,
+                            "mode": "pad",
+                            "raw_dur": ch_dur,
+                            "slot_dur": tgt,
+                            "padded": info["padded"],
+                            "trimmed": info["trimmed"],
+                        }
+                    )
                 parts.append(outp)
 
                 # 내부 갭 삽입
@@ -276,12 +346,18 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
         else:
             # 🔸 일반(머지 아님 or 단일 슬롯) 처리: 오른쪽 갭에서 시간 '빌려' slot 확대
             raw = os.path.join(work, f"final_{i:04d}_raw.wav")
-            synthesize(tr["text"], ref, language=target_lang, out_path=raw, model_name=TTS_MODEL)
+            synthesize(
+                tr["text"],
+                ref,
+                language=target_lang,
+                out_path=raw,
+                model_name=TTS_MODEL,
+            )
             raw_dur = ffprobe_duration(raw)
 
-            need   = max(0.0, raw_dur - slot)         # 모자란 시간
-            borrow = min(need, right_gaps[i])          # 오른쪽 갭에서 빌릴 수 있는 만큼
-            slot_used = slot + borrow                  # 실사용 슬롯
+            need = max(0.0, raw_dur - slot)  # 모자란 시간
+            borrow = min(need, right_gaps[i])  # 오른쪽 갭에서 빌릴 수 있는 만큼
+            slot_used = slot + borrow  # 실사용 슬롯
             gap_after = max(0.0, right_gaps[i] - borrow)  # 남겨둘 외부 갭
             post_gap = gap_after
 
@@ -291,20 +367,33 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
                 tmp = fit.replace(".wav", "_tempo.wav")
                 time_stretch(raw, tmp, tempo=tempo, ar=24000)
                 info = trim_or_pad_to_duration(tmp, fit, slot_used, ar=24000)
-                final_report.append({
-                    "i": i, "mode": "speedup+borrow", "tempo": tempo,
-                    "borrowed": borrow, "raw_dur": raw_dur,
-                    "slot": slot, "slot_used": slot_used,
-                    "padded": info["padded"], "trimmed": info["trimmed"]
-                })
+                final_report.append(
+                    {
+                        "i": i,
+                        "mode": "speedup+borrow",
+                        "tempo": tempo,
+                        "borrowed": borrow,
+                        "raw_dur": raw_dur,
+                        "slot": slot,
+                        "slot_used": slot_used,
+                        "padded": info["padded"],
+                        "trimmed": info["trimmed"],
+                    }
+                )
             else:
                 info = trim_or_pad_to_duration(raw, fit, slot_used, ar=24000)
-                final_report.append({
-                    "i": i, "mode": "pad/fit+borrow",
-                    "borrowed": borrow, "raw_dur": raw_dur,
-                    "slot": slot, "slot_used": slot_used,
-                    "padded": info["padded"], "trimmed": info["trimmed"]
-                })
+                final_report.append(
+                    {
+                        "i": i,
+                        "mode": "pad/fit+borrow",
+                        "borrowed": borrow,
+                        "raw_dur": raw_dur,
+                        "slot": slot,
+                        "slot_used": slot_used,
+                        "padded": info["padded"],
+                        "trimmed": info["trimmed"],
+                    }
+                )
             parts.append(fit)
 
         # 🔹 외부(세그 간) 절대 갭 삽입: 빌림 반영한 post_gap 사용
@@ -326,10 +415,12 @@ async def tts_finalize_stage(job_id: str, target_lang: str, ref_voice: Optional[
     save_meta(work, meta)
     return {"workdir": work, "dubbed_wav": dubbed, "final_report": final_report}
 
+
 # ----------------- ASR/번역/원샷 -----------------
 async def asr_only(file: UploadFile) -> Dict:
     job_id = str(uuid.uuid4())[:8]
-    work = os.path.join("/app/data", job_id); _ensure_dir(work)
+    work = os.path.join("/app/data", job_id)
+    _ensure_dir(work)
     in_path = os.path.join(work, file.filename)
     with open(in_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
@@ -351,21 +442,29 @@ async def asr_only(file: UploadFile) -> Dict:
 
     # 4) STT 세그 기반 speech 구간(여유 margin 포함) 산출
     margin = float(os.getenv("STT_INTERVAL_MARGIN", "0.10"))  # ±100ms
-    stt_intervals = merge_intervals([
-        (max(0.0, float(s["start"]) - margin), min(float(total), float(s["end"]) + margin))
-        for s in segments if float(s["end"]) > float(s["start"])
-    ])
+    stt_intervals = merge_intervals(
+        [
+            (
+                max(0.0, float(s["start"]) - margin),
+                min(float(total), float(s["end"]) + margin),
+            )
+            for s in segments
+            if float(s["end"]) > float(s["start"])
+        ]
+    )
 
     # 5) 사람말 전용/FX 트랙 만들기 (타임라인 보존)
     speech_only_48k = os.path.join(work, "speech_only_48k.wav")
-    vocals_fx_48k   = os.path.join(work, "vocals_fx_48k.wav")
+    vocals_fx_48k = os.path.join(work, "vocals_fx_48k.wav")
     mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
     nonspeech_intervals = complement_intervals(stt_intervals, total)
     mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
 
     # 6) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
     wav_16k = os.path.join(work, "speech_16k.wav")
-    run(f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}")
+    run(
+        f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}"
+    )
 
     # 필요시, segments를 speech_only에서 재추출하고 싶다면 아래로 대체:
     # segments = _whisper_transcribe(wav_16k)
@@ -373,12 +472,15 @@ async def asr_only(file: UploadFile) -> Dict:
     # 7) gap 기록(VAD 기준; 원본 타임라인 유지)
     for i in range(len(segments)):
         if i < len(segments) - 1:
-            st = float(segments[i]["end"]); en = float(segments[i+1]["start"])
+            st = float(segments[i]["end"])
+            en = float(segments[i + 1]["start"])
             segments[i]["gap_after_vad"] = sum_silence_between(silences, st, en)
             segments[i]["gap_after"] = max(0.0, en - st)
         else:
             segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
+
+    _annotate_segments(segments)
 
     meta = {
         "job_id": job_id,
@@ -387,9 +489,9 @@ async def asr_only(file: UploadFile) -> Dict:
         "audio_full_48k": full_48k,
         "vocals_48k": vocals_48k,
         "bgm_48k": bgm_48k,
-        "speech_only_48k": speech_only_48k,   # ✅ 사람말만
-        "vocals_fx_48k":  vocals_fx_48k,      # ✅ 동물/환호 등 비-스피치
-        "wav_16k": wav_16k,                   # ✅ 이후 파이프라인 입력
+        "speech_only_48k": speech_only_48k,  # ✅ 사람말만
+        "vocals_fx_48k": vocals_fx_48k,  # ✅ 동물/환호 등 비-스피치
+        "wav_16k": wav_16k,  # ✅ 이후 파이프라인 입력
         "orig_duration": total,
         "segments": segments,
         "silences": silences,
@@ -398,6 +500,7 @@ async def asr_only(file: UploadFile) -> Dict:
     }
     save_meta(work, meta)
     return meta
+
 
 def mux_stage(job_id: str) -> str:
     work = os.path.join("/app/data", job_id)
@@ -422,7 +525,8 @@ def mux_stage(job_id: str) -> str:
 # (선택) 원샷 dub: 번역 자동수정 없이, 최종 규칙으로 바로 처리
 def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
     job_id = str(uuid.uuid4())[:8]
-    work = os.path.join("/app/data", job_id); _ensure_dir(work)
+    work = os.path.join("/app/data", job_id)
+    _ensure_dir(work)
 
     # 1) 오디오 추출 (+분리)
     wav_16k = os.path.join(work, "audio_16k.wav")
@@ -439,8 +543,11 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         raise RuntimeError("No speech detected.")
 
     # 4) MT (자동 수정 없음)
-    base = _translate_texts_safe([s["text"] for s in segments], src="ko", tgt=target_lang)
-    translations = [{"start": s["start"], "end": s["end"], "text": t} for s, t in zip(segments, base)]
+    base = translate_texts([s["text"] for s in segments], src="ko", tgt=target_lang)
+    translations = [
+        {"start": s["start"], "end": s["end"], "text": t}
+        for s, t in zip(segments, base)
+    ]
 
     # 5) 합성/보정/결합
     parts: List[str] = []
@@ -452,9 +559,17 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
 
     final_report: List[Dict] = []
     for i, tr in enumerate(translations):
-        start = float(tr["start"]); end = float(tr["end"]); slot = max(0.05, end - start)
+        start = float(tr["start"])
+        end = float(tr["end"])
+        slot = max(0.05, end - start)
         raw = os.path.join(work, f"seg_{i:04d}_raw.wav")
-        synthesize(tr["text"], ref_path, language=target_lang, out_path=raw, model_name=TTS_MODEL)
+        synthesize(
+            tr["text"],
+            ref_path,
+            language=target_lang,
+            out_path=raw,
+            model_name=TTS_MODEL,
+        )
         raw_dur = ffprobe_duration(raw)
 
         fit = os.path.join(work, f"seg_{i:04d}_slot.wav")
@@ -463,18 +578,33 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
             tmp = fit.replace(".wav", "_tempo.wav")
             time_stretch(raw, tmp, tempo=tempo, ar=24000)
             info = trim_or_pad_to_duration(tmp, fit, slot, ar=24000)
-            final_report.append({"i": i, "mode": "speedup", "tempo": tempo,
-                                 "raw_dur": raw_dur, "slot_dur": slot,
-                                 "padded": info["padded"], "trimmed": info["trimmed"]})
+            final_report.append(
+                {
+                    "i": i,
+                    "mode": "speedup",
+                    "tempo": tempo,
+                    "raw_dur": raw_dur,
+                    "slot_dur": slot,
+                    "padded": info["padded"],
+                    "trimmed": info["trimmed"],
+                }
+            )
         else:
             info = trim_or_pad_to_duration(raw, fit, slot, ar=24000)
-            final_report.append({"i": i, "mode": "pad",
-                                 "raw_dur": raw_dur, "slot_dur": slot,
-                                 "padded": info["padded"], "trimmed": info["trimmed"]})
+            final_report.append(
+                {
+                    "i": i,
+                    "mode": "pad",
+                    "raw_dur": raw_dur,
+                    "slot_dur": slot,
+                    "padded": info["padded"],
+                    "trimmed": info["trimmed"],
+                }
+            )
         parts.append(fit)
 
         if i < len(translations) - 1:
-            next_start = float(translations[i+1]["start"])
+            next_start = float(translations[i + 1]["start"])
             gap = max(0.0, next_start - end)
             if gap > 0.0001:
                 g = os.path.join(work, f"gap_{i:04d}.wav")
@@ -505,15 +635,18 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
         "bgm_48k": bgm_48k,
         "wav_16k": wav_16k,
         "dubbed_wav": dubbed_wav,
-        "final_mix": mix,            # (정보 보존)
+        "final_mix": mix,  # (정보 보존)
         "final_report": final_report,
-        "output": out_video
+        "output": out_video,
     }
     with open(os.path.join(work, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return meta
 
-def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[List[Dict], List[Dict]]:
+
+def _apply_merges(
+    segments: List[Dict], merges: List[Tuple[int, int]]
+) -> Tuple[List[Dict], List[Dict]]:
     """
     merges: [(start_idx, end_idx), ...] 0-based, inclusive, 오름차순/비겹침/연속 범위만 허용
     반환: (merged_segments, merge_map)
@@ -535,7 +668,8 @@ def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[L
 
     # 겹치거나 역순/중첩 금지, 반드시 오름차순 비중첩
     for i in range(1, len(norm)):
-        prev = norm[i-1]; cur = norm[i]
+        prev = norm[i - 1]
+        cur = norm[i]
         if cur[0] <= prev[1]:
             raise ValueError(f"overlapping merges: {prev} and {cur}")
 
@@ -546,22 +680,28 @@ def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[L
 
     def _append_original(idx):
         nonlocal new_idx
-        merged.append({
-            "start": float(segments[idx]["start"]),
-            "end": float(segments[idx]["end"]),
-            "text": segments[idx]["text"],
-        })
+        merged.append(
+            {
+                "start": float(segments[idx]["start"]),
+                "end": float(segments[idx]["end"]),
+                "text": segments[idx]["text"],
+            }
+        )
         mapping.append({"new_index": new_idx, "from": [idx]})
         new_idx += 1
 
     def _append_merged(a, b):
         nonlocal new_idx
         start = float(segments[a]["start"])
-        end   = float(segments[b]["end"])
+        end = float(segments[b]["end"])
         # 텍스트는 공백 하나로 연결
-        text = " ".join(segments[k]["text"].strip() for k in range(a, b+1) if segments[k]["text"].strip())
+        text = " ".join(
+            segments[k]["text"].strip()
+            for k in range(a, b + 1)
+            if segments[k]["text"].strip()
+        )
         merged.append({"start": start, "end": end, "text": text})
-        mapping.append({"new_index": new_idx, "from": list(range(a, b+1))})
+        mapping.append({"new_index": new_idx, "from": list(range(a, b + 1))})
         new_idx += 1
 
     for rng in norm:
@@ -581,6 +721,7 @@ def _apply_merges(segments: List[Dict], merges: List[Tuple[int,int]]) -> Tuple[L
 
     return merged, mapping
 
+
 def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
     work = os.path.join("/app/data", job_id)
     meta = load_meta(work)
@@ -594,53 +735,66 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
         return {"segments": src, "merge_map": [], "note": "no merges applied"}
 
     # 정규화 & 정렬
-    rngs = [(int(a), int(b)) for a,b in plan]
+    rngs = [(int(a), int(b)) for a, b in plan]
     rngs.sort(key=lambda x: x[0])
     for i in range(1, len(rngs)):
-        if rngs[i][0] <= rngs[i-1][1]:
+        if rngs[i][0] <= rngs[i - 1][1]:
             raise ValueError(f"overlapping merges: {rngs[i-1]} and {rngs[i]}")
 
     merged = []
     merge_map = []
-    merge_layouts = {}  # new_index -> {"from":[...], "slots":[{start,end}], "gaps":[...]}
-    cur = 0; new_idx = 0
+    merge_layouts = (
+        {}
+    )  # new_index -> {"from":[...], "slots":[{start,end}], "gaps":[...]}
+    cur = 0
+    new_idx = 0
 
     def append_original(k):
         nonlocal new_idx
-        merged.append({"start": src[k]["start"], "end": src[k]["end"], "text": src[k]["text"]})
+        merged.append(
+            {"start": src[k]["start"], "end": src[k]["end"], "text": src[k]["text"]}
+        )
         merge_map.append({"new_index": new_idx, "from": [k]})
         # 단일 슬롯(머지 아님)도 레이아웃을 둬두면 일관 처리 쉬움
         merge_layouts[new_idx] = {
             "from": [k],
             "slots": [{"start": src[k]["start"], "end": src[k]["end"]}],
-            "gaps":  []
+            "gaps": [],
         }
         new_idx += 1
 
-    def append_merged(a,b):
+    def append_merged(a, b):
         nonlocal new_idx
-        start = float(src[a]["start"]); end = float(src[b]["end"])
-        text = " ".join(s["text"].strip() for s in src[a:b+1] if s["text"].strip())
+        start = float(src[a]["start"])
+        end = float(src[b]["end"])
+        text = " ".join(s["text"].strip() for s in src[a : b + 1] if s["text"].strip())
         merged.append({"start": start, "end": end, "text": text})
-        merge_map.append({"new_index": new_idx, "from": list(range(a,b+1))})
-        slots = [{"start": src[k]["start"], "end": src[k]["end"]} for k in range(a,b+1)]
+        merge_map.append({"new_index": new_idx, "from": list(range(a, b + 1))})
+        slots = [
+            {"start": src[k]["start"], "end": src[k]["end"]} for k in range(a, b + 1)
+        ]
         # 🔹 내부 갭: VAD 침묵 합으로 계산, 없으면 STT 차이 fallback
-        gaps  = []
+        gaps = []
         for k in range(a, b):
-            st = float(src[k]["end"]); en = float(src[k+1]["start"])
+            st = float(src[k]["end"])
+            en = float(src[k + 1]["start"])
             vad_gap = sum_silence_between(meta.get("silences", []), st, en)
             if vad_gap <= 0.0:
                 vad_gap = max(0.0, en - st)
             gaps.append(vad_gap)
-        merge_layouts[new_idx] = {"from": list(range(a,b+1)), "slots": slots, "gaps": gaps}
+        merge_layouts[new_idx] = {
+            "from": list(range(a, b + 1)),
+            "slots": slots,
+            "gaps": gaps,
+        }
         new_idx += 1
 
-    for a,b in rngs:
+    for a, b in rngs:
         while cur < a:
             append_original(cur)
             cur += 1
-        append_merged(a,b)
-        cur = b+1
+        append_merged(a, b)
+        cur = b + 1
     while cur < len(src):
         append_original(cur)
         cur += 1
@@ -649,15 +803,24 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
     if "segments_backup" not in meta:
         meta["segments_backup"] = meta["segments"]
     meta["segments"] = merged
-    meta["merge_history"] = meta.get("merge_history", []) + [{"plan": plan, "merge_map": merge_map}]
+    meta["merge_history"] = meta.get("merge_history", []) + [
+        {"plan": plan, "merge_map": merge_map}
+    ]
     meta["merge_layouts"] = merge_layouts
 
     # 이전 산물 무효화
-    for k in ("translations","duration_report","final_report","dubbed_wav","output"):
+    for k in (
+        "translations",
+        "duration_report",
+        "final_report",
+        "dubbed_wav",
+        "output",
+    ):
         meta.pop(k, None)
 
     save_meta(work, meta)
     return {"segments": merged, "merge_map": merge_map}
+
 
 # ----------------- Voice Sample: 무음 제거 후 음성만 연결 -----------------
 def build_voice_sample_stage(job_id: str, out_sr: int = 48000):
@@ -686,7 +849,8 @@ def build_voice_sample_stage(job_id: str, out_sr: int = 48000):
     max_gap = float(os.getenv("VOICE_SAMPLE_MAX_GAP", "1.5"))
     parts: List[str] = []
     for i, s in enumerate(segs):
-        st = float(s.get("start", 0.0)); en = float(s.get("end", 0.0))
+        st = float(s.get("start", 0.0))
+        en = float(s.get("end", 0.0))
         if en <= st + 1e-3:
             continue
         part = os.path.join(work, f"sample_part_{i:04d}.wav")
@@ -705,7 +869,14 @@ def build_voice_sample_stage(job_id: str, out_sr: int = 48000):
     if not parts:
         raise RuntimeError("No non-empty segments to build sample")
 
-    out24 = os.path.join(work, "voice_sample_24k.wav" if out_sr == 24000 else f"voice_sample_{out_sr//1000}k.wav")
+    out24 = os.path.join(
+        work,
+        (
+            "voice_sample_24k.wav"
+            if out_sr == 24000
+            else f"voice_sample_{out_sr//1000}k.wav"
+        ),
+    )
     concat_audio(parts, out24)
 
     meta["voice_sample_wav"] = out24

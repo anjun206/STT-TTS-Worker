@@ -243,15 +243,14 @@ def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str =
 
 def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
     """
-    BGM과 TTS를 덕킹 없이 단순 합성한다.
-    - 출력 포맷: 48k stereo
+    BGM을 TTS에 사이드체인 컴프레션으로 살짝 눌러 섞기.
+    - 최종 출력: 48k 스테레오
     """
+    # tts가 모노라도 amix가 알아서 섞습니다.
     run(
         'ffmpeg -y -i {bgm} -i {tts} -filter_complex '
-        '"[0:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo[bgm];'
-        ' [1:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono,'
-        'pan=stereo|c0=c0|c1=c0[tts];'
-        ' [bgm][tts]amix=inputs=2:duration=first:dropout_transition=0" '
+        '"[0:a][1:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        ' [duck][1:a]amix=inputs=2:duration=first:dropout_transition=0" '
         '-ar 48000 -ac 2 {out}'.format(
             bgm=shlex.quote(bgm_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
@@ -282,16 +281,16 @@ def mask_keep_intervals(in_wav: str, keep: list[tuple[float, float]], out_wav: s
 
 def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
     """
-    BGM과 효과음, TTS를 덕킹 없이 단순 합성한다.
-    출력 포맷은 48k stereo.
+    (BGM + 비-스피치 FX) 를 먼저 합친 뒤, TTS로 사이드체인-컴프레션 걸고 마지막에 TTS와 섞음.
+    결과는 48k 스테레오.
     """
     run(
         'ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex '
         '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,'
-        'aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo[bed];'
-        ' [2:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono,'
-        'pan=stereo|c0=c0|c1=c0[tts];'
-        ' [bed][tts]amix=inputs=2:duration=first:dropout_transition=0" '
+        'aformat=channel_layouts=stereo[bed];'
+        ' [2:a]pan=stereo|c0=c0|c1=c0,asplit=2[tts_sc][tts_mix];'
+        ' [bed][tts_sc]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        ' [duck][tts_mix]amix=inputs=2:duration=first:dropout_transition=0" '
         '-ar 48000 -ac 2 {out}'.format(
             bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )

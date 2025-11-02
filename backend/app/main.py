@@ -31,23 +31,13 @@ app.add_middleware(
 
 # 🔁 변경: 새 TTS 단계 import
 from .pipeline import (
-    asr_only, translate_stage,
+    dub, asr_only, translate_stage,
     tts_probe_stage, tts_finalize_stage,
     mux_stage, merge_segments_stage,
     build_voice_sample_stage, synthesize_single_text,
 )
 from .utils_meta import load_meta, save_meta
-from .aws_worker import start_background_worker, stop_background_worker
-
-
-@app.on_event("startup")
-async def _aws_worker_startup():
-    start_background_worker()
-
-
-@app.on_event("shutdown")
-async def _aws_worker_shutdown():
-    stop_background_worker()
+import shutil
 
 # ---------- 바디 모델 (PATCH는 사용 안 해도 OK) ----------
 class SegmentPatch(BaseModel):
@@ -82,6 +72,29 @@ class TranslationsPatch(BaseModel):
 def health():
     return {"ok": True}
 
+# ---------- 원샷 dub ----------
+@app.post("/dub")
+async def dub_endpoint(
+    file: UploadFile = File(..., description="Video or audio file"),
+    target_lang: str = Form(..., description="'en' or 'ja'"),
+    ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)"),
+):
+    assert target_lang in ("en", "ja", "ko"), "target_lang must be 'en' or 'ja' or 'ko'"
+    tmp_dir = "/app/data/tmp"
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    in_path = os.path.join(tmp_dir, file.filename)
+    with open(in_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    ref_path = None
+    if ref_voice is not None:
+        ref_path = os.path.join(tmp_dir, ref_voice.filename)
+        with open(ref_path, "wb") as f2:
+            shutil.copyfileobj(ref_voice.file, f2)
+
+    meta = dub(in_path, target_lang=target_lang, ref_wav=ref_path)
+    return JSONResponse({"job_id": meta["job_id"], "output": meta["output"], "workdir": meta["workdir"]})
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
@@ -176,6 +189,15 @@ async def tts_finalize_endpoint(
     out = await tts_finalize_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)
     return {"ok": True, **out}
 
+# (호환) 예전 /tts → finalize로 동작
+@app.post("/tts/{job_id}")
+async def tts_compat_endpoint(
+    job_id: str,
+    target_lang: str = Form(..., description="'en' or 'ja' or 'ko'"),
+    ref_voice: Optional[UploadFile] = File(None, description="Optional reference WAV (>=6s)")
+):
+    out = await tts_finalize_stage(job_id, target_lang=target_lang, ref_voice=ref_voice)
+    return {"ok": True, **out}
 
 # 🔊 단일 문장 TTS
 @app.post("/tts-single")
@@ -216,7 +238,7 @@ async def voice_sample_endpoint(
     """
     meta = await asr_only(file)
     job_id = meta["job_id"]
-    out = build_voice_sample_stage(job_id)  
+    out = build_voice_sample_stage(job_id)
     return FileResponse(out["voice_sample_wav"], media_type="audio/wav", filename=f"voice_sample_{job_id}.wav")
 
 
