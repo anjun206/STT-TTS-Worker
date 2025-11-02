@@ -529,8 +529,8 @@ def dub(video_in: str, target_lang: str, ref_wav: Optional[str] = None) -> Dict:
     _ensure_dir(work)
 
     # 1) 오디오 추출 (+분리)
-    wav_16k = os.path.join(work, "audio_16k.wav")
-    full_48k, vocals_48k, bgm_48k = _extract_audio_16k_mono(video_in, wav_16k)  # ★ 받기
+    # _extract_tracks: (full_48k, vocals_48k, bgm_48k, vocals_16k_raw) 반환
+    full_48k, vocals_48k, bgm_48k, wav_16k = _extract_tracks(video_in, work)
 
     # 2) 레퍼런스
     ref_path = ref_wav or os.path.join(work, "ref.wav")
