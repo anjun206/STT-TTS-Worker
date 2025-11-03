@@ -19,7 +19,13 @@ from .pipeline import (
     translate_stage,
     tts_finalize_stage,
 )
-from .utils import cut_wav_segment, ffprobe_duration, mask_keep_intervals, run
+from .utils import (
+    cut_wav_segment,
+    ffprobe_duration,
+    mask_keep_intervals,
+    mix_bgm_with_tts,
+    run,
+)
 from .utils_meta import load_meta, save_meta
 from .vad import (
     complement_intervals,
@@ -279,7 +285,8 @@ class QueueWorker:
         speech_src = meta.get("speech_only_48k") or meta.get("audio_full_48k")
         bgm_src = meta.get("bgm_48k")
         tts_src = meta.get("dubbed_wav")
-        mix_src = meta.get("final_mix") or meta.get("dubbed_wav")
+        final_mix_src = meta.get("final_mix")
+        mix_src = final_mix_src or meta.get("dubbed_wav")
         video_src = meta.get("input")
 
         def _cut_if_possible(
@@ -304,28 +311,45 @@ class QueueWorker:
 
             # 원본 발화
             local_source = os.path.join(segment_dir, f"{base_name}_source.wav")
-            if _cut_if_possible(speech_src, local_source, start, end):
+            has_source = _cut_if_possible(speech_src, local_source, start, end)
+            if has_source:
                 source_key = f"{prefix}/{base_name}_source.wav"
                 self._upload_file(local_source, source_key, "audio/wav")
                 assets["source_key"] = source_key
 
             # BGM
             local_bgm = os.path.join(segment_dir, f"{base_name}_bgm.wav")
-            if _cut_if_possible(bgm_src, local_bgm, start, end):
+            has_bgm = _cut_if_possible(bgm_src, local_bgm, start, end)
+            if has_bgm:
                 bgm_key = f"{prefix}/{base_name}_bgm.wav"
                 self._upload_file(local_bgm, bgm_key, "audio/wav")
                 assets["bgm_key"] = bgm_key
 
             # 합성 음성
             local_tts = os.path.join(segment_dir, f"{base_name}_tts.wav")
-            if _cut_if_possible(tts_src, local_tts, start, end):
+            has_tts = _cut_if_possible(tts_src, local_tts, start, end)
+            if has_tts:
                 tts_key = f"{prefix}/{base_name}_tts.wav"
                 self._upload_file(local_tts, tts_key, "audio/wav")
                 assets["tts_key"] = tts_key
 
-            # 최종 믹스
+            # 배경음이 섞인 최종 믹스(없으면 TTS로 폴백)
             local_mix = os.path.join(segment_dir, f"{base_name}_mix.wav")
-            if _cut_if_possible(mix_src, local_mix, start, end):
+            mix_created = False
+            if final_mix_src and _cut_if_possible(final_mix_src, local_mix, start, end):
+                mix_created = True
+            elif has_bgm and has_tts and os.path.exists(local_bgm) and os.path.exists(local_tts):
+                try:
+                    mix_bgm_with_tts(local_bgm, local_tts, local_mix)
+                    mix_created = True
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(
+                        "Failed to create bgm mix for segment %s: %s", base_name, exc
+                    )
+            elif mix_src and _cut_if_possible(mix_src, local_mix, start, end):
+                mix_created = True
+
+            if mix_created and os.path.exists(local_mix):
                 mix_key = f"{prefix}/{base_name}_mix.wav"
                 self._upload_file(local_mix, mix_key, "audio/wav")
                 assets["mix_key"] = mix_key
