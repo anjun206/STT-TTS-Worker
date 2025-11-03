@@ -19,7 +19,7 @@ from .pipeline import (
     translate_stage,
     tts_finalize_stage,
 )
-from .utils import ffprobe_duration, mask_keep_intervals, run
+from .utils import cut_wav_segment, ffprobe_duration, mask_keep_intervals, run
 from .utils_meta import load_meta, save_meta
 from .vad import (
     complement_intervals,
@@ -130,17 +130,32 @@ def _build_segment_payload(
         translation_text = ""
         if idx < len(translations):
             translation_text = translations[idx].get("text", "")
+        assets = seg.get("assets") or {}
         payload.append(
             {
+                "segment_id": str(seg.get("seg_id", idx)),
+                "segment_text": seg.get("text", ""),
+                "score": seg.get("score"),
+                "start_point": start,
+                "end_point": end,
+                "editor_id": None,
+                "translate_context": translation_text,
+                "sub_langth": length,
+                "issues": seg.get("issues", []),
+                # legacy keys (for compatibility with older consumers)
                 "seg_id": seg.get("seg_id", idx),
                 "seg_txt": seg.get("text", ""),
-                "score": seg.get("score"),
                 "start": start,
                 "end": end,
+                "length": length,
                 "editor": None,
                 "trans_txt": translation_text,
-                "length": length,
-                "issues": seg.get("issues", []),
+                "assets": assets,
+                "source_key": seg.get("source_key") or assets.get("source_key"),
+                "bgm_key": seg.get("bgm_key") or assets.get("bgm_key"),
+                "tts_key": seg.get("tts_key") or assets.get("tts_key"),
+                "mix_key": seg.get("mix_key") or assets.get("mix_key"),
+                "video_key": seg.get("video_key") or assets.get("video_key"),
             }
         )
     return payload
@@ -160,6 +175,10 @@ class QueueWorker:
         self.result_meta_prefix = os.getenv(
             "JOB_RESULT_METADATA_PREFIX",
             "projects/{project_id}/outputs/metadata/{job_id}.json",
+        )
+        self.interim_segment_prefix = os.getenv(
+            "JOB_INTERIM_SEGMENT_PREFIX",
+            "projects/{project_id}/interim/{job_id}/segments",
         )
         self.visibility_timeout = int(os.getenv("JOB_VISIBILITY_TIMEOUT", "300"))
         self.poll_wait = int(os.getenv("JOB_QUEUE_WAIT", "20"))
@@ -213,6 +232,12 @@ class QueueWorker:
                 if success:
                     self._delete_message(receipt)
 
+    def _delete_message(self, receipt: str) -> None:
+        try:
+            self.sqs.delete_message(QueueUrl=self.queue_url, ReceiptHandle=receipt)
+        except (BotoCoreError, ClientError) as exc:
+            logger.error("Failed to delete SQS message: %s", exc)
+
     def _handle_job(self, payload: Dict[str, Any]) -> None:
         task = (payload.get("task") or "full_pipeline").lower()
         if task == "full_pipeline":
@@ -221,6 +246,120 @@ class QueueWorker:
             self._handle_segment_mix(payload)
         else:
             raise JobProcessingError(f"Unsupported task type: {task}")
+
+    def _upload_file(
+        self, local_path: str, key: str, content_type: Optional[str] = None
+    ) -> None:
+        extra: Dict[str, Any] | None = None
+        if content_type:
+            extra = {"ContentType": content_type}
+        kwargs: Dict[str, Any] = {}
+        if extra:
+            kwargs["ExtraArgs"] = extra
+        self.s3.upload_file(local_path, self.bucket, key, **kwargs)
+
+    def _prepare_segment_assets(
+        self,
+        project_id: str,
+        job_id: str,
+        meta: Dict[str, Any],
+    ) -> None:
+        segments = meta.get("segments") or []
+        if not segments:
+            return
+
+        workdir = meta.get("workdir") or _ensure_workdir(job_id)
+        segment_dir = os.path.join(workdir, "segments")
+        os.makedirs(segment_dir, exist_ok=True)
+
+        prefix = self.interim_segment_prefix.format(
+            project_id=project_id, job_id=job_id
+        ).rstrip("/")
+
+        speech_src = meta.get("speech_only_48k") or meta.get("audio_full_48k")
+        bgm_src = meta.get("bgm_48k")
+        tts_src = meta.get("dubbed_wav")
+        mix_src = meta.get("final_mix") or meta.get("dubbed_wav")
+        video_src = meta.get("input")
+
+        def _cut_if_possible(
+            src: Optional[str], dst: str, start: float, end: float
+        ) -> bool:
+            if not src or not os.path.exists(src):
+                return False
+            cut_wav_segment(src, dst, start, end, ar=48000)
+            return True
+
+        for idx, seg in enumerate(segments):
+            try:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if end <= start + 1e-3:
+                continue
+
+            base_name = f"{idx:04d}"
+            assets: Dict[str, Any] = {}
+
+            # 원본 발화
+            local_source = os.path.join(segment_dir, f"{base_name}_source.wav")
+            if _cut_if_possible(speech_src, local_source, start, end):
+                source_key = f"{prefix}/{base_name}_source.wav"
+                self._upload_file(local_source, source_key, "audio/wav")
+                assets["source_key"] = source_key
+
+            # BGM
+            local_bgm = os.path.join(segment_dir, f"{base_name}_bgm.wav")
+            if _cut_if_possible(bgm_src, local_bgm, start, end):
+                bgm_key = f"{prefix}/{base_name}_bgm.wav"
+                self._upload_file(local_bgm, bgm_key, "audio/wav")
+                assets["bgm_key"] = bgm_key
+
+            # 합성 음성
+            local_tts = os.path.join(segment_dir, f"{base_name}_tts.wav")
+            if _cut_if_possible(tts_src, local_tts, start, end):
+                tts_key = f"{prefix}/{base_name}_tts.wav"
+                self._upload_file(local_tts, tts_key, "audio/wav")
+                assets["tts_key"] = tts_key
+
+            # 최종 믹스
+            local_mix = os.path.join(segment_dir, f"{base_name}_mix.wav")
+            if _cut_if_possible(mix_src, local_mix, start, end):
+                mix_key = f"{prefix}/{base_name}_mix.wav"
+                self._upload_file(local_mix, mix_key, "audio/wav")
+                assets["mix_key"] = mix_key
+
+            # 구간 영상 (원본 오디오 포함)
+            if video_src and os.path.exists(video_src):
+                local_video = os.path.join(segment_dir, f"{base_name}_video.mp4")
+                duration = max(0.05, end - start)
+                run(
+                    " ".join(
+                        [
+                            "ffmpeg -y",
+                            f"-ss {start:.6f}",
+                            f"-i {shlex.quote(video_src)}",
+                            f"-t {duration:.6f}",
+                            "-map 0:v:0",
+                            "-map 0:a:0?",
+                            "-c:v copy",
+                            "-c:a copy",
+                            "-movflags +faststart",
+                            shlex.quote(local_video),
+                        ]
+                    )
+                )
+                video_key = f"{prefix}/{base_name}_video.mp4"
+                self._upload_file(local_video, video_key, "video/mp4")
+                assets["video_key"] = video_key
+
+            if assets:
+                seg.setdefault("assets", {}).update(assets)
+                for key, value in assets.items():
+                    seg[key] = value
+
+        save_meta(workdir, meta)
 
     def _handle_full_pipeline(self, payload: Dict[str, Any]) -> None:
         job_id = payload.get("job_id")
@@ -253,6 +392,8 @@ class QueueWorker:
             )
             asyncio.run(tts_finalize_stage(job_id, target_lang, None))
             output_path = mux_stage(job_id)
+            meta = load_meta(workdir)
+            self._prepare_segment_assets(project_id, job_id, meta)
             meta = load_meta(workdir)
             segments_payload = _build_segment_payload(meta, translations)
             result_key = self.result_video_prefix.format(
@@ -289,6 +430,9 @@ class QueueWorker:
                 "target_lang": target_lang,
                 "source_lang": source_lang,
                 "input_key": input_key,
+                "segment_assets_prefix": self.interim_segment_prefix.format(
+                    project_id=project_id, job_id=job_id
+                ),
             }
             self._post_status(
                 callback_url,
@@ -337,8 +481,9 @@ class QueueWorker:
                 index = segment.get("index")
                 if index is None:
                     raise JobProcessingError("segment entry missing index")
-                bgm_key = segment.get("bgm_key")
-                tts_key = segment.get("tts_key")
+                assets = segment.get("assets") or {}
+                bgm_key = segment.get("bgm_key") or assets.get("bgm_key")
+                tts_key = segment.get("tts_key") or assets.get("tts_key")
                 if not bgm_key or not tts_key:
                     if not intermediate_prefix:
                         raise JobProcessingError(
@@ -351,9 +496,9 @@ class QueueWorker:
                 if not target_prefix:
                     target_prefix = os.path.dirname(bgm_key)
                 target_prefix = target_prefix.rstrip("/")
-                output_key = (
-                    segment.get("output_key") or f"{target_prefix}/{index}_mix.wav"
-                )
+                output_key = segment.get("output_key") or assets.get("mix_key")
+                if not output_key:
+                    output_key = f"{target_prefix}/{index}_mix.wav"
                 local_bgm = os.path.join(workdir, f"{index}_bgm.wav")
                 local_tts = os.path.join(workdir, f"{index}_tts.wav")
                 mixed_path = os.path.join(workdir, f"{index}_mix.wav")

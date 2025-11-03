@@ -25,9 +25,11 @@ SQS 큐를 구독해 영상 더빙 파이프라인과 세그먼트별 오디오 
 | `projects/{project_id}/inputs/` | 원본 영상 업로드 경로 |
 | `projects/{project_id}/outputs/videos/{job_id}.mp4` | 최종 더빙 영상 |
 | `projects/{project_id}/outputs/metadata/{job_id}.json` | 세그먼트·번역 정보를 포함한 메타데이터 |
-| `projects/{project_id}/interim/{job_id}/segments/{index}_bgm.wav` | 세그먼트별 배경음 (옵션) |
-| `projects/{project_id}/interim/{job_id}/segments/{index}_tts.wav` | 세그먼트별 TTS 음성 (옵션) |
+| `projects/{project_id}/interim/{job_id}/segments/{index}_source.wav` | 세그먼트별 원본 발화 구간 |
+| `projects/{project_id}/interim/{job_id}/segments/{index}_bgm.wav` | 세그먼트별 배경/FX 트랙 |
+| `projects/{project_id}/interim/{job_id}/segments/{index}_tts.wav` | 세그먼트별 합성 음성 |
 | `projects/{project_id}/interim/{job_id}/segments/{index}_mix.wav` | 세그먼트별 믹스 결과 |
+| `projects/{project_id}/interim/{job_id}/segments/{index}_video.mp4` | 세그먼트별 무음 비디오 클립 |
 
 > `segment_mix` 작업은 `bgm_key`/`tts_key`가 명시되지 않은 경우 `intermediate_prefix`를 기반으로 `{index}_bgm.wav`, `{index}_tts.wav`를 자동 유추합니다.
 
@@ -52,8 +54,14 @@ SQS 큐를 구독해 영상 더빙 파이프라인과 세그먼트별 오디오 
   "callback_url": "https://api.example.com/api/editor/jobs/{job_id}/status",
   "intermediate_prefix": "projects/123/interim/{job_id}/segments",
   "segments": [
-    { "index": 1, "bgm_gain": 0.35, "tts_gain": 1.0 },
-    { "index": 2, "bgm_key": "projects/.../2_bgm.wav", "tts_key": "projects/.../2_tts.wav" }
+    {
+      "index": 1,
+      "bgm_key": "projects/123/interim/{job_id}/segments/0001_bgm.wav",
+      "tts_key": "projects/123/interim/{job_id}/segments/0001_tts.wav",
+      "output_key": "projects/123/interim/{job_id}/segments/0001_mix.wav",
+      "bgm_gain": 0.35,
+      "tts_gain": 1.0
+    }
   ]
 }
 ```
