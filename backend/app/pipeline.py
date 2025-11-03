@@ -26,6 +26,8 @@ from .utils import (
     mask_keep_intervals,
     mix_bgm_fx_with_tts,
     cut_wav_segment,
+    detect_mean_volume_db,
+    apply_gain_db,
 )
 from .utils_meta import load_meta, save_meta
 from .vad import (
@@ -409,6 +411,23 @@ async def tts_finalize_stage(
     concat_audio(parts, out24)
     dubbed = os.path.join(work, "dubbed.wav")
     run(f"ffmpeg -y -i {out24} -ar 48000 -ac 1 {dubbed}")
+
+    # 🔊 원본 화자 음량에 맞춰 TTS 레벨 보정
+    speech_ref = meta.get("speech_only_48k") or meta.get("vocals_48k")
+    tts_gain_db: Optional[float] = None
+    if speech_ref and os.path.exists(speech_ref):
+        ref_db = detect_mean_volume_db(speech_ref)
+        tts_db = detect_mean_volume_db(dubbed)
+        if ref_db is not None and tts_db is not None:
+            gain_db = ref_db - tts_db
+            if abs(gain_db) >= 0.5:
+                gain_db = max(min(gain_db, 18.0), -12.0)
+                boosted = os.path.join(work, "dubbed_gain.wav")
+                apply_gain_db(dubbed, boosted, gain_db, ar=48000, ac=1)
+                os.replace(boosted, dubbed)
+                tts_gain_db = gain_db
+    if tts_gain_db is not None:
+        meta["tts_gain_db"] = tts_gain_db
 
     meta["dubbed_wav"] = dubbed
     meta["final_report"] = final_report

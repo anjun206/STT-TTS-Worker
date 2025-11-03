@@ -6,6 +6,7 @@ faster-whisper==1.0.3
 whisperx==3.1.1
 pyannote.audio==3.1.1
 onnxruntime-gpu==1.19.0
+demucs
 
 # Translation stack (supports tc-big ko->en and alt models via env)
 transformers==4.44.2
