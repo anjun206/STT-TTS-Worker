@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -12,6 +13,7 @@ import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
 from .pipeline import (
+    TTS_MODEL,
     _annotate_segments,
     _extract_tracks,
     _whisper_transcribe,
@@ -21,11 +23,16 @@ from .pipeline import (
 )
 from .utils import (
     cut_wav_segment,
+    concat_audio,
     ffprobe_duration,
     mask_keep_intervals,
     mix_bgm_with_tts,
     run,
+    trim_or_pad_to_duration,
+    detect_mean_volume_db,
+    apply_gain_db,
 )
+from .tts import synthesize
 from .utils_meta import load_meta, save_meta
 from .vad import (
     complement_intervals,
@@ -249,6 +256,8 @@ class QueueWorker:
 
         if task == "full_pipeline":
             self._handle_full_pipeline(payload)
+        elif task == "segment_tts":
+            self._handle_segment_tts(payload)
         elif task in {"segment_mix", "tts_bgm_mix"}:
             self._handle_segment_mix(payload)
         else:
@@ -482,6 +491,291 @@ class QueueWorker:
             self._safe_fail(callback_url, wrapped)
             raise wrapped
 
+    def _handle_segment_tts(self, payload: Dict[str, Any]) -> None:
+        job_id = payload.get("job_id")
+        callback_url = payload.get("callback_url")
+        segment_payload: Dict[str, Any] = payload.get("segment") or {}
+
+        if not job_id or not callback_url:
+            raise JobProcessingError("segment_tts requires job_id and callback_url")
+
+        try:
+            segment_index = int(segment_payload.get("segment_index"))
+        except (TypeError, ValueError):
+            raise JobProcessingError("segment_tts requires a numeric segment_index")
+
+        text = segment_payload.get("text")
+        if not text:
+            raise JobProcessingError("segment_tts requires translated text")
+
+        project_id = segment_payload.get("project_id") or payload.get("project_id")
+        segment_id = segment_payload.get("segment_id")
+        assets: Dict[str, Any] = segment_payload.get("assets") or {}
+        source_keys: List[str] = [
+            str(k) for k in segment_payload.get("source_keys") or [] if k
+        ]
+        assets_prefix = segment_payload.get("segment_assets_prefix") or payload.get(
+            "segment_assets_prefix"
+        )
+
+        base_name = f"{segment_index:04d}"
+        if not source_keys and assets.get("source_key"):
+            source_keys.append(str(assets["source_key"]))
+        if not source_keys and assets_prefix:
+            source_keys.append(f"{assets_prefix.rstrip('/')}/{base_name}_source.wav")
+
+        fallback_ref_key = assets.get("tts_key")
+        workdir = os.path.join(_ensure_workdir(job_id), "segment_tts")
+        os.makedirs(workdir, exist_ok=True)
+
+        try:
+            self._post_status(
+                callback_url,
+                "in_progress",
+                metadata={
+                    "stage": "segment_tts_started",
+                    "job_id": job_id,
+                    "project_id": project_id,
+                    "segment_index": segment_index,
+                },
+            )
+
+            local_refs: List[str] = []
+            for idx, key in enumerate(source_keys):
+                local_path = os.path.join(workdir, f"ref_{idx:02d}.wav")
+                try:
+                    self.s3.download_file(self.bucket, key, local_path)
+                    local_refs.append(local_path)
+                except (BotoCoreError, ClientError) as exc:
+                    logger.warning("Failed to download source key %s: %s", key, exc)
+
+            if not local_refs and fallback_ref_key:
+                local_fallback = os.path.join(workdir, "ref_fallback.wav")
+                try:
+                    self.s3.download_file(self.bucket, fallback_ref_key, local_fallback)
+                    local_refs.append(local_fallback)
+                except (BotoCoreError, ClientError) as exc:
+                    logger.warning(
+                        "Failed to download fallback TTS key %s: %s",
+                        fallback_ref_key,
+                        exc,
+                    )
+
+            if not local_refs:
+                raise JobProcessingError("No reference audio available for segment_tts")
+
+            converted_refs: List[str] = []
+            for path in local_refs:
+                base = os.path.splitext(os.path.basename(path))[0]
+                converted = os.path.join(workdir, f"{base}_24k.wav")
+                run(
+                    f"ffmpeg -y -i {shlex.quote(path)} -ar 24000 -ac 1 {shlex.quote(converted)}"
+                )
+                converted_refs.append(converted)
+
+            if len(converted_refs) == 1:
+                ref_candidate = converted_refs[0]
+            else:
+                ref_candidate = os.path.join(workdir, "ref_concat.wav")
+                concat_audio(converted_refs, ref_candidate)
+
+            ref_path = os.path.join(workdir, "ref.wav")
+            ref_duration = ffprobe_duration(ref_candidate)
+            target_ref_duration = 6.0 if ref_duration < 6.0 else ref_duration
+            trim_or_pad_to_duration(
+                ref_candidate, ref_path, target_ref_duration, ar=24000
+            )
+
+            target_lang = (
+                segment_payload.get("target_lang")
+                or payload.get("target_lang")
+                or self.default_target_lang
+            )
+
+            raw_tts_path = os.path.join(workdir, "tts_raw.wav")
+            try:
+                synthesize(
+                    text,
+                    ref_path,
+                    language=target_lang,
+                    out_path=raw_tts_path,
+                    model_name=TTS_MODEL,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                raise JobProcessingError(f"TTS synthesis failed: {exc}") from exc
+
+            start_point = float(segment_payload.get("start_point", 0.0) or 0.0)
+            end_point = float(segment_payload.get("end_point", 0.0) or 0.0)
+            slot = (
+                max(0.05, end_point - start_point) if end_point > start_point else None
+            )
+            sub_length = segment_payload.get("sub_length")
+            if sub_length is not None:
+                try:
+                    sub_length = float(sub_length)
+                except (TypeError, ValueError):
+                    sub_length = None
+
+            target_duration = sub_length if sub_length and sub_length > 0 else slot
+
+            final_tts_path = raw_tts_path
+            if target_duration and target_duration > 0:
+                fitted_path = os.path.join(workdir, "tts_fitted.wav")
+                trim_or_pad_to_duration(
+                    raw_tts_path, fitted_path, target_duration, ar=24000
+                )
+                final_tts_path = fitted_path
+
+            # Align TTS loudness to original 화자 평균 볼륨
+            ref_db = detect_mean_volume_db(ref_path)
+            tts_db = detect_mean_volume_db(final_tts_path)
+            gain_db_applied: Optional[float] = None
+            if ref_db is not None and tts_db is not None:
+                gain_db = ref_db - tts_db
+                if abs(gain_db) >= 0.5:
+                    gain_db = max(min(gain_db, 18.0), -12.0)
+                    boosted_path = os.path.join(workdir, "tts_gain.wav")
+                    apply_gain_db(final_tts_path, boosted_path, gain_db, ar=24000, ac=1)
+                    os.replace(boosted_path, final_tts_path)
+                    gain_db_applied = gain_db
+
+            # 48k 변환 (mix 단계와 동일한 샘플레이트 사용)
+            tts_48k_path = os.path.join(workdir, "tts_48k.wav")
+            run(
+                f"ffmpeg -y -i {shlex.quote(final_tts_path)} -ar 48000 -ac 1 {shlex.quote(tts_48k_path)}"
+            )
+
+            tts_key = assets.get("tts_key")
+            if not tts_key and assets_prefix:
+                tts_key = f"{assets_prefix.rstrip('/')}/{base_name}_tts.wav"
+            if not tts_key:
+                raise JobProcessingError("Unable to determine TTS upload key")
+
+            self._upload_file(tts_48k_path, tts_key, "audio/wav")
+
+            mix_key = assets.get("mix_key")
+            bgm_key = assets.get("bgm_key")
+            uploaded_mix_key = None
+
+            if bgm_key:
+                local_bgm = os.path.join(workdir, "bgm.wav")
+                self.s3.download_file(self.bucket, bgm_key, local_bgm)
+
+                aligned_bgm = local_bgm
+                if target_duration and target_duration > 0:
+                    bgm_duration = ffprobe_duration(local_bgm)
+                    aligned_bgm = os.path.join(workdir, "bgm_aligned.wav")
+                    if abs(bgm_duration - target_duration) <= 0.01:
+                        shutil.copyfile(local_bgm, aligned_bgm)
+                    elif bgm_duration > target_duration + 0.01:
+                        run(
+                            " ".join(
+                                [
+                                    "ffmpeg -y",
+                                    f"-i {shlex.quote(local_bgm)}",
+                                    f'-af "atrim=0:{target_duration:.6f},asetpts=PTS-STARTPTS"',
+                                    "-ar 48000",
+                                    "-ac 2",
+                                    shlex.quote(aligned_bgm),
+                                ]
+                            )
+                        )
+                    else:
+                        pad = max(0.0, target_duration - bgm_duration)
+                        run(
+                            " ".join(
+                                [
+                                    "ffmpeg -y",
+                                    f"-i {shlex.quote(local_bgm)}",
+                                    f'-filter_complex "apad=pad_dur={pad:.6f},atrim=0:{target_duration:.6f},asetpts=PTS-STARTPTS"',
+                                    "-ar 48000",
+                                    "-ac 2",
+                                    shlex.quote(aligned_bgm),
+                                ]
+                            )
+                        )
+
+                bgm_gain = (
+                    segment_payload.get("bgm_gain") or assets.get("bgm_gain") or 1.0
+                )
+                tts_mix_gain = (
+                    segment_payload.get("tts_gain") or assets.get("tts_gain") or 1.0
+                )
+                try:
+                    bgm_gain = float(bgm_gain)
+                except (TypeError, ValueError):
+                    bgm_gain = 1.0
+                try:
+                    tts_mix_gain = float(tts_mix_gain)
+                except (TypeError, ValueError):
+                    tts_mix_gain = 1.0
+
+                local_mix = os.path.join(workdir, "mix.wav")
+                mix_filter = (
+                    f"[0:a]volume={bgm_gain:.4f}[bgm];"
+                    f"[1:a]volume={tts_mix_gain:.4f}[tts];"
+                    "[bgm][tts]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[m];"
+                    "[m]alimiter=limit=0.95,asetpts=PTS-STARTPTS"
+                )
+                run(
+                    " ".join(
+                        [
+                            "ffmpeg -y",
+                            f"-i {shlex.quote(aligned_bgm)}",
+                            f"-i {shlex.quote(tts_48k_path)}",
+                            f'-filter_complex "{mix_filter}"',
+                            "-ar 48000",
+                            "-ac 2",
+                            shlex.quote(local_mix),
+                        ]
+                    )
+                )
+
+                upload_key = mix_key or (
+                    f"{assets_prefix.rstrip('/')}/{base_name}_mix.wav"
+                    if assets_prefix
+                    else None
+                )
+                if upload_key:
+                    self._upload_file(local_mix, upload_key, "audio/wav")
+                    uploaded_mix_key = upload_key
+            else:
+                raise JobProcessingError(
+                    "segment_tts requires bgm_key to generate mixed audio"
+                )
+
+            metadata: Dict[str, Any] = {
+                "stage": "segment_tts_completed",
+                "segment": {
+                    "segment_index": segment_index,
+                    "segment_id": segment_id,
+                    "translate_context": text,
+                    "tts_key": tts_key,
+                },
+            }
+            if uploaded_mix_key:
+                metadata["segment"]["mix_key"] = uploaded_mix_key
+            if gain_db_applied is not None:
+                metadata["segment"]["tts_gain_db"] = gain_db_applied
+            if assets_prefix:
+                metadata["segment_assets_prefix"] = assets_prefix
+            if project_id:
+                metadata["project_id"] = project_id
+
+            self._post_status(callback_url, "done", metadata=metadata)
+
+        except (BotoCoreError, ClientError) as exc:
+            failure = JobProcessingError(f"AWS client error: {exc}")
+            self._safe_fail(callback_url, failure)
+            raise failure
+        except JobProcessingError as exc:
+            self._safe_fail(callback_url, exc)
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            wrapped = JobProcessingError(str(exc))
+            self._safe_fail(callback_url, wrapped)
+            raise wrapped
+
     def _handle_segment_mix(self, payload: Dict[str, Any]) -> None:
         job_id = payload.get("job_id")
         callback_url = payload.get("callback_url")
@@ -552,7 +846,7 @@ class QueueWorker:
                 self.s3.download_file(self.bucket, bgm_key, local_bgm)
                 self.s3.download_file(self.bucket, tts_key, local_tts)
 
-                bgm_gain = float(segment.get("bgm_gain", 0.35))
+                bgm_gain = float(segment.get("bgm_gain", 1.0))
                 tts_gain = float(segment.get("tts_gain", 1.0))
 
                 ffmpeg_cmd = (
