@@ -339,7 +339,12 @@ class QueueWorker:
             mix_created = False
             if final_mix_src and _cut_if_possible(final_mix_src, local_mix, start, end):
                 mix_created = True
-            elif has_bgm and has_tts and os.path.exists(local_bgm) and os.path.exists(local_tts):
+            elif (
+                has_bgm
+                and has_tts
+                and os.path.exists(local_bgm)
+                and os.path.exists(local_tts)
+            ):
                 try:
                     mix_bgm_with_tts(local_bgm, local_tts, local_mix)
                     mix_created = True
@@ -508,8 +513,9 @@ class QueueWorker:
                 if index is None:
                     raise JobProcessingError("segment entry missing index")
 
-                bgm_key = segment.get("bgm_key")
-                tts_key = segment.get("tts_key")
+                assets = segment.get("assets") or {}
+                bgm_key = segment.get("bgm_key") or assets.get("bgm_key")
+                tts_key = segment.get("tts_key") or assets.get("tts_key")
                 if not bgm_key or not tts_key:
                     if not intermediate_prefix:
                         raise JobProcessingError(
@@ -523,7 +529,11 @@ class QueueWorker:
                 if not target_prefix:
                     target_prefix = os.path.dirname(bgm_key)
                 target_prefix = target_prefix.rstrip("/")
-                output_key = segment.get("output_key") or f"{target_prefix}/{index}_mix.wav"
+                output_key = (
+                    segment.get("output_key")
+                    or assets.get("mix_key")
+                    or f"{target_prefix}/{index}_mix.wav"
+                )
 
                 local_bgm = os.path.join(workdir, f"{index}_bgm.wav")
                 local_tts = os.path.join(workdir, f"{index}_tts.wav")
@@ -550,7 +560,7 @@ class QueueWorker:
                     f"-i {shlex.quote(local_tts)} "
                     f"-i {shlex.quote(local_bgm)} "
                     "-filter_complex "
-                    f"\"[0:a]volume={tts_gain}[v0];[1:a]volume={bgm_gain}[v1];[v0][v1]amix=inputs=2:duration=longest\" "
+                    f'"[0:a]volume={tts_gain}[v0];[1:a]volume={bgm_gain}[v1];[v0][v1]amix=inputs=2:duration=longest" '
                     f"-c:a pcm_s16le {shlex.quote(mixed_path)}"
                 )
                 run(ffmpeg_cmd)
