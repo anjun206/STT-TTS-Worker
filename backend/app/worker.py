@@ -246,6 +246,7 @@ class QueueWorker:
 
     def _handle_job(self, payload: Dict[str, Any]) -> None:
         task = (payload.get("task") or "full_pipeline").lower()
+
         if task == "full_pipeline":
             self._handle_full_pipeline(payload)
         elif task in {"segment_mix", "tts_bgm_mix"}:
@@ -500,14 +501,15 @@ class QueueWorker:
                     "count": len(segments),
                 },
             )
+
             mix_results: List[Dict[str, Any]] = []
             for segment in segments:
                 index = segment.get("index")
                 if index is None:
                     raise JobProcessingError("segment entry missing index")
-                assets = segment.get("assets") or {}
-                bgm_key = segment.get("bgm_key") or assets.get("bgm_key")
-                tts_key = segment.get("tts_key") or assets.get("tts_key")
+
+                bgm_key = segment.get("bgm_key")
+                tts_key = segment.get("tts_key")
                 if not bgm_key or not tts_key:
                     if not intermediate_prefix:
                         raise JobProcessingError(
@@ -516,16 +518,18 @@ class QueueWorker:
                     prefix = intermediate_prefix.rstrip("/")
                     bgm_key = bgm_key or f"{prefix}/{index}_bgm.wav"
                     tts_key = tts_key or f"{prefix}/{index}_tts.wav"
+
                 target_prefix = output_prefix or intermediate_prefix
                 if not target_prefix:
                     target_prefix = os.path.dirname(bgm_key)
                 target_prefix = target_prefix.rstrip("/")
-                output_key = segment.get("output_key") or assets.get("mix_key")
-                if not output_key:
-                    output_key = f"{target_prefix}/{index}_mix.wav"
+                output_key = segment.get("output_key") or f"{target_prefix}/{index}_mix.wav"
+
                 local_bgm = os.path.join(workdir, f"{index}_bgm.wav")
                 local_tts = os.path.join(workdir, f"{index}_tts.wav")
+
                 mixed_path = os.path.join(workdir, f"{index}_mix.wav")
+
                 logger.info(
                     "Processing segment %s for job %s (bgm=%s, tts=%s -> %s)",
                     index,
@@ -534,20 +538,25 @@ class QueueWorker:
                     tts_key,
                     output_key,
                 )
+
                 self.s3.download_file(self.bucket, bgm_key, local_bgm)
                 self.s3.download_file(self.bucket, tts_key, local_tts)
+
                 bgm_gain = float(segment.get("bgm_gain", 0.35))
                 tts_gain = float(segment.get("tts_gain", 1.0))
+
                 ffmpeg_cmd = (
                     "ffmpeg -y "
                     f"-i {shlex.quote(local_tts)} "
                     f"-i {shlex.quote(local_bgm)} "
                     "-filter_complex "
-                    f'"[0:a]volume={tts_gain}[v0];[1:a]volume={bgm_gain}[v1];[v0][v1]amix=inputs=2:duration=longest" '
+                    f"\"[0:a]volume={tts_gain}[v0];[1:a]volume={bgm_gain}[v1];[v0][v1]amix=inputs=2:duration=longest\" "
                     f"-c:a pcm_s16le {shlex.quote(mixed_path)}"
                 )
                 run(ffmpeg_cmd)
+
                 self.s3.upload_file(mixed_path, self.bucket, output_key)
+
                 mix_results.append(
                     {
                         "index": index,
@@ -558,6 +567,7 @@ class QueueWorker:
                         "tts_gain": tts_gain,
                     }
                 )
+
             self._post_status(
                 callback_url,
                 "done",
