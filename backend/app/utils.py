@@ -6,6 +6,7 @@ import re
 import tempfile
 import math
 import glob
+import importlib.util
 
 # -------------------- 공용 실행/시간 유틸 --------------------
 
@@ -220,12 +221,16 @@ def extract_audio_full(video_in: str, wav_out: str):
 def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str = "htdemucs"):
     """
     Demucs 2-stems 분리: vocals / no_vocals
-    실패하면 예외를 던지지 말고 원본을 그대로 복사하여 폴백.
+    demucs 미설치 또는 실행 실패 시 즉시 예외를 발생시킨다.
     """
+    if importlib.util.find_spec("demucs") is None:
+        raise RuntimeError("demucs package not installed; background separation is unavailable")
+
+    outdir = os.path.join(os.path.dirname(out_vocals), "sep")
     try:
-        outdir = os.path.join(os.path.dirname(out_vocals), "sep")
-        run(f"python -m demucs.separate -n {model} --two-stems=vocals -o {shlex.quote(outdir)} {shlex.quote(in_wav)}")
-        # 결과 탐색
+        run(
+            f"python -m demucs.separate -n {model} --two-stems=vocals -o {shlex.quote(outdir)} {shlex.quote(in_wav)}"
+        )
         base = os.path.splitext(os.path.basename(in_wav))[0]
         cand_dir = glob.glob(os.path.join(outdir, model, base))
         if not cand_dir:
@@ -235,22 +240,74 @@ def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str =
         nv = glob.glob(os.path.join(cand_dir, "no_vocals.wav"))[0]
         run(f"ffmpeg -y -i {shlex.quote(v)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}")
         run(f"ffmpeg -y -i {shlex.quote(nv)} -ar 48000 -ac 2 {shlex.quote(out_bgm)}")
-    except Exception as e:
-        print("WARN: demucs separation failed, fallback to original mix:", e)
-        # 폴백: 보이스=원본, bgm=무음
-        run(f"ffmpeg -y -i {shlex.quote(in_wav)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}")
-        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(in_wav):.3f} {shlex.quote(out_bgm)}")
+    except Exception as exc:
+        raise RuntimeError("demucs separation failed") from exc
+
+def detect_mean_volume_db(wav_path: str) -> Optional[float]:
+    """
+    ffmpeg volumedetect를 이용해 평균 음량(dBFS)을 반환. 측정 실패 시 None.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                wav_path,
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:  # pragma: no cover - 환경 이슈
+        raise RuntimeError("ffmpeg not found while measuring volume") from exc
+
+    if proc.returncode != 0:
+        # volumedetect는 stderr에 기록 후 0으로 종료하지만, 입력이 짧으면 실패할 수 있음
+        output = (proc.stdout or "") + (proc.stderr or "")
+    else:
+        output = proc.stderr or ""
+
+    match = re.search(r"mean_volume:\s*(-?[0-9.]+|-\s*inf)\s*dB", output)
+    if not match:
+        return None
+    value = match.group(1).replace(" ", "")
+    if value.lower() in {"-inf", "inf"}:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+def apply_gain_db(in_wav: str, out_wav: str, gain_db: float, ar: int = 48000, ac: int = 1):
+    """
+    지정한 dB 게인을 적용. 양수면 증폭, 음수면 감쇠.
+    """
+    if abs(gain_db) < 1e-3 and os.path.abspath(in_wav) == os.path.abspath(out_wav):
+        # 자가 대입이면서 변경 불필요하면 종료
+        return
+    run(
+        f'ffmpeg -y -i {shlex.quote(in_wav)} -af "volume={gain_db:.4f}dB" '
+        f"-ar {ar} -ac {ac} {shlex.quote(out_wav)}"
+    )
 
 def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
     """
-    BGM을 TTS에 사이드체인 컴프레션으로 살짝 눌러 섞기.
+    BGM과 TTS를 동일한 레벨로 단순 합성.
     - 최종 출력: 48k 스테레오
     """
-    # tts가 모노라도 amix가 알아서 섞습니다.
     run(
         'ffmpeg -y -i {bgm} -i {tts} -filter_complex '
-        '"[0:a][1:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
-        ' [duck][1:a]amix=inputs=2:duration=first:dropout_transition=0" '
+        '"[1:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0[tts_st];'
+        ' [0:a][tts_st]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,'
+        'alimiter=limit=0.95" '
         '-ar 48000 -ac 2 {out}'.format(
             bgm=shlex.quote(bgm_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
@@ -281,16 +338,16 @@ def mask_keep_intervals(in_wav: str, keep: list[tuple[float, float]], out_wav: s
 
 def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
     """
-    (BGM + 비-스피치 FX) 를 먼저 합친 뒤, TTS로 사이드체인-컴프레션 걸고 마지막에 TTS와 섞음.
-    결과는 48k 스테레오.
+    (BGM + 비-스피치 FX)를 먼저 합친 뒤 TTS와 동일 레벨로 섞는다.
+    최종 출력은 48k 스테레오.
     """
     run(
         'ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex '
-        '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,'
+        '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,'
         'aformat=channel_layouts=stereo[bed];'
-        ' [2:a]pan=stereo|c0=c0|c1=c0,asplit=2[tts_sc][tts_mix];'
-        ' [bed][tts_sc]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
-        ' [duck][tts_mix]amix=inputs=2:duration=first:dropout_transition=0" '
+        ' [2:a]aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0[tts_st];'
+        ' [bed][tts_st]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,'
+        'alimiter=limit=0.95" '
         '-ar 48000 -ac 2 {out}'.format(
             bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
