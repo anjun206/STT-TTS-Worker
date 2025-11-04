@@ -26,6 +26,7 @@ from .utils import (
     mask_keep_intervals,
     mix_bgm_fx_with_tts,
     cut_wav_segment,
+    detect_mean_volume_db,
 )
 from .utils_meta import load_meta, save_meta
 from .vad import (
@@ -459,6 +460,13 @@ async def asr_only(file: UploadFile) -> Dict:
     mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
     nonspeech_intervals = complement_intervals(stt_intervals, total)
     mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
+
+    # demucs 실패 등으로 bgm이 비게 될 경우, 비-스피치 트랙으로 폴백
+    bgm_energy = detect_mean_volume_db(bgm_48k)
+    if bgm_energy is None or bgm_energy < -70.0:
+        fx_energy = detect_mean_volume_db(vocals_fx_48k)
+        if fx_energy is not None and fx_energy > -80.0:
+            shutil.copyfile(vocals_fx_48k, bgm_48k)
 
     # 6) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
     wav_16k = os.path.join(work, "speech_16k.wav")

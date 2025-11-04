@@ -9,16 +9,26 @@ import glob
 
 # -------------------- 공용 실행/시간 유틸 --------------------
 
-def run(cmd: str, cwd: Optional[str]=None) -> None:
+
+def run(cmd: str, cwd: Optional[str] = None) -> None:
     print(f"[RUN] {cmd}")
-    proc = subprocess.run(shlex.split(cmd), cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.run(
+        shlex.split(cmd),
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
     print(proc.stdout)
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}\n{proc.stdout}")
 
+
 def ffprobe_duration(path: str) -> float:
     cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {shlex.quote(path)}"
-    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr)
     try:
@@ -26,14 +36,19 @@ def ffprobe_duration(path: str) -> float:
     except:
         return 0.0
 
+
 # -------------------- 오디오 가공 기본 --------------------
+
 
 def make_silence(path: str, seconds: float, ar: int = 24000):
     if seconds <= 0.0001:
         # 0초에 가까우면 빈 파일을 만들어 concat 오류 방지
         open(path, "wb").close()
         return
-    run(f"ffmpeg -y -f lavfi -i anullsrc=r={ar}:cl=mono -t {seconds:.6f} -ar {ar} -ac 1 {shlex.quote(path)}")
+    run(
+        f"ffmpeg -y -f lavfi -i anullsrc=r={ar}:cl=mono -t {seconds:.6f} -ar {ar} -ac 1 {shlex.quote(path)}"
+    )
+
 
 def time_stretch(in_path: str, out_path: str, tempo: float, ar: int = 24000):
     """
@@ -42,10 +57,13 @@ def time_stretch(in_path: str, out_path: str, tempo: float, ar: int = 24000):
     """
     # rubberband 우선
     try:
-        run(f'ffmpeg -y -i {shlex.quote(in_path)} -af "rubberband=tempo={tempo:.6f}:formant=1" -ar {ar} -ac 1 {shlex.quote(out_path)}')
+        run(
+            f'ffmpeg -y -i {shlex.quote(in_path)} -af "rubberband=tempo={tempo:.6f}:formant=1" -ar {ar} -ac 1 {shlex.quote(out_path)}'
+        )
         return
     except Exception:
         pass
+
     # fallback: atempo(0.5~2.0 per filter) - 체인 분할
     def split_tempos(t):
         parts = []
@@ -59,8 +77,12 @@ def time_stretch(in_path: str, out_path: str, tempo: float, ar: int = 24000):
                 t /= 2.0
         parts.append(t)
         return parts
+
     filters = ",".join([f"atempo={t:.6f}" for t in split_tempos(tempo)])
-    run(f'ffmpeg -y -i {shlex.quote(in_path)} -af "{filters}" -ar {ar} -ac 1 {shlex.quote(out_path)}')
+    run(
+        f'ffmpeg -y -i {shlex.quote(in_path)} -af "{filters}" -ar {ar} -ac 1 {shlex.quote(out_path)}'
+    )
+
 
 def concat_audio(files: List[str], out_path: str) -> str:
     """
@@ -75,7 +97,14 @@ def concat_audio(files: List[str], out_path: str) -> str:
     run(f"ffmpeg -y -f concat -safe 0 -i {list_path} -c copy {shlex.quote(out_path)}")
     return out_path
 
-def trim_or_pad_to_duration(in_path: str, out_path: str, target_dur: float, ar: int = 24000, fade_out_ms: int = 30):
+
+def trim_or_pad_to_duration(
+    in_path: str,
+    out_path: str,
+    target_dur: float,
+    ar: int = 24000,
+    fade_out_ms: int = 30,
+):
     """
     입력을 target_dur로 정확히 맞춤.
     - 짧으면 뒤에 무음 붙임
@@ -98,35 +127,42 @@ def trim_or_pad_to_duration(in_path: str, out_path: str, target_dur: float, ar: 
         return {"padded": pad, "trimmed": 0.0}
     elif cur > target_dur + 1e-3:
         # 끝 페이드 후 정확 트림
-        st = max(0.0, target_dur - fade_out_ms/1000.0)
+        st = max(0.0, target_dur - fade_out_ms / 1000.0)
         run(
-            f'ffmpeg -y -i {shlex.quote(in_path)} '
+            f"ffmpeg -y -i {shlex.quote(in_path)} "
             f'-af "afade=t=out:st={st:.6f}:d={fade_out_ms/1000.0:.6f},atrim=0:{target_dur:.6f},asetpts=PTS-STARTPTS" '
-            f'-ar {ar} -ac 1 {shlex.quote(out_path)}'
+            f"-ar {ar} -ac 1 {shlex.quote(out_path)}"
         )
         return {"padded": 0.0, "trimmed": cur - target_dur}
     else:
         # 거의 동일: 리샘플/모노만 보장
-        run(f"ffmpeg -y -i {shlex.quote(in_path)} -ar {ar} -ac 1 {shlex.quote(out_path)}")
+        run(
+            f"ffmpeg -y -i {shlex.quote(in_path)} -ar {ar} -ac 1 {shlex.quote(out_path)}"
+        )
         return {"padded": 0.0, "trimmed": 0.0}
+
 
 def replace_audio_in_video(video_in: str, audio_in: str, video_out: str) -> None:
     # 오디오 PTS 0부터, AAC 48k, faststart
     run(
-        f'ffmpeg -y -i {shlex.quote(video_in)} -i {shlex.quote(audio_in)} '
-        f'-map 0:v:0 -map 1:a:0 -c:v copy '
+        f"ffmpeg -y -i {shlex.quote(video_in)} -i {shlex.quote(audio_in)} "
+        f"-map 0:v:0 -map 1:a:0 -c:v copy "
         f'-af "asetpts=PTS-STARTPTS" -c:a aac -ar 48000 -b:a 192k '
-        f'-shortest -movflags +faststart {shlex.quote(video_out)}'
+        f"-shortest -movflags +faststart {shlex.quote(video_out)}"
     )
+
 
 # -------------------- (기존) 분석/도움 함수들 --------------------
 
+
 def detect_silences(wav_path: str, noise_db: str = "-35dB", min_s: float = 0.25):
     cmd = (
-        f'ffmpeg -hide_banner -nostats -i {shlex.quote(wav_path)} '
-        f'-af silencedetect=noise={noise_db}:d={min_s} -f null -'
+        f"ffmpeg -hide_banner -nostats -i {shlex.quote(wav_path)} "
+        f"-af silencedetect=noise={noise_db}:d={min_s} -f null -"
     )
-    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
     txt = proc.stdout
     silences = []
     last = None
@@ -140,22 +176,28 @@ def detect_silences(wav_path: str, noise_db: str = "-35dB", min_s: float = 0.25)
             last = None
     return silences
 
+
 def segment_boundaries(duration: float, silences):
     pts = [0.0]
-    for s,e in silences:
-        pts += [s,e]
+    for s, e in silences:
+        pts += [s, e]
     pts.append(duration)
     pts = [max(0.0, p) for p in sorted(set(pts))]
     out = []
-    for i in range(len(pts)-1):
-        start, end = pts[i], pts[i+1]
-        is_sil = any(abs(start - s) < 1e-3 and abs(end - e) < 1e-3 for s,e in silences)
+    for i in range(len(pts) - 1):
+        start, end = pts[i], pts[i + 1]
+        is_sil = any(abs(start - s) < 1e-3 and abs(end - e) < 1e-3 for s, e in silences)
         out.append((start, end, is_sil))
     return out
 
+
 def cut_wav_segment(src: str, dst: str, start: float, end: float, ar: int = 24000):
-    start = max(0.0, float(start)); end = max(start, float(end))
-    run(f'ffmpeg -y -ss {start:.6f} -to {end:.6f} -i {shlex.quote(src)} -ar {ar} -ac 1 {shlex.quote(dst)}')
+    start = max(0.0, float(start))
+    end = max(start, float(end))
+    run(
+        f"ffmpeg -y -ss {start:.6f} -to {end:.6f} -i {shlex.quote(src)} -ar {ar} -ac 1 {shlex.quote(dst)}"
+    )
+
 
 def _nearest_silence_time(target: float, silences, window: float = 0.25):
     """
@@ -163,16 +205,23 @@ def _nearest_silence_time(target: float, silences, window: float = 0.25):
     없으면 None.
     """
     best_t, best_d = None, 1e9
-    for s,e in silences:
-        mid = 0.5*(s+e)
+    for s, e in silences:
+        mid = 0.5 * (s + e)
         if (target - window) <= mid <= (target + window):
             d = abs(mid - target)
             if d < best_d:
                 best_d, best_t = d, mid
     return best_t
 
-def split_audio_by_targets(raw_wav: str, target_durations: list[float], out_dir: str, prefix: str,
-                           search_window: float = 0.25, ar: int = 24000) -> list[str]:
+
+def split_audio_by_targets(
+    raw_wav: str,
+    target_durations: list[float],
+    out_dir: str,
+    prefix: str,
+    search_window: float = 0.25,
+    ar: int = 24000,
+) -> list[str]:
     """
     raw_wav을 target durations(슬롯 길이들)의 누적합 경계에 맞춰 N개로 자름.
     각 경계는 '근처 무음(mid)'로 스냅(없으면 그 시간 그대로).
@@ -184,7 +233,8 @@ def split_audio_by_targets(raw_wav: str, target_durations: list[float], out_dir:
     cum = [0.0]
     acc = 0.0
     for d in targets[:-1]:  # 마지막 경계는 total에 맡긴다(언더/오버라도 자투리 흡수)
-        acc += d; cum.append(acc)
+        acc += d
+        cum.append(acc)
     # 실제 총합과 raw 길이 차이를 고려
     raw_end = total
     boundaries = [0.0] + [min(max(0.0, t), raw_end) for t in cum[1:]] + [raw_end]
@@ -199,32 +249,40 @@ def split_audio_by_targets(raw_wav: str, target_durations: list[float], out_dir:
 
     # 단조성 보정(겹침 제거)
     for i in range(1, len(snapped)):
-        if snapped[i] <= snapped[i-1] + 1e-3:
-            snapped[i] = snapped[i-1] + 1e-3
+        if snapped[i] <= snapped[i - 1] + 1e-3:
+            snapped[i] = snapped[i - 1] + 1e-3
     if snapped[-1] < snapped[-2] + 0.02:
         snapped[-1] = snapped[-2] + 0.02
 
     # 컷
     outs = []
     for i in range(len(targets)):
-        s, e = snapped[i], snapped[i+1]
+        s, e = snapped[i], snapped[i + 1]
         part = os.path.join(out_dir, f"{prefix}_part_{i:02d}.wav")
         cut_wav_segment(raw_wav, part, s, e, ar=ar)
         outs.append(part)
     return outs
 
+
 def extract_audio_full(video_in: str, wav_out: str):
     # 원본 오디오를 48k 스테레오 wav로 추출
-    run(f"ffmpeg -y -i {shlex.quote(video_in)} -map 0:a:0 -ac 2 -ar 48000 -vn -c:a pcm_s16le {shlex.quote(wav_out)}")
+    run(
+        f"ffmpeg -y -i {shlex.quote(video_in)} -map 0:a:0 -ac 2 -ar 48000 -vn -c:a pcm_s16le {shlex.quote(wav_out)}"
+    )
 
-def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str = "htdemucs"):
+
+def separate_bgm_vocals(
+    in_wav: str, out_vocals: str, out_bgm: str, model: str = "htdemucs"
+):
     """
     Demucs 2-stems 분리: vocals / no_vocals
     실패하면 예외를 던지지 말고 원본을 그대로 복사하여 폴백.
     """
     try:
         outdir = os.path.join(os.path.dirname(out_vocals), "sep")
-        run(f"python -m demucs.separate -n {model} --two-stems=vocals -o {shlex.quote(outdir)} {shlex.quote(in_wav)}")
+        run(
+            f"python -m demucs.separate -n {model} --two-stems=vocals -o {shlex.quote(outdir)} {shlex.quote(in_wav)}"
+        )
         # 결과 탐색
         base = os.path.splitext(os.path.basename(in_wav))[0]
         cand_dir = glob.glob(os.path.join(outdir, model, base))
@@ -238,8 +296,13 @@ def separate_bgm_vocals(in_wav: str, out_vocals: str, out_bgm: str, model: str =
     except Exception as e:
         print("WARN: demucs separation failed, fallback to original mix:", e)
         # 폴백: 보이스=원본, bgm=무음
-        run(f"ffmpeg -y -i {shlex.quote(in_wav)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}")
-        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(in_wav):.3f} {shlex.quote(out_bgm)}")
+        run(
+            f"ffmpeg -y -i {shlex.quote(in_wav)} -ar 48000 -ac 2 {shlex.quote(out_vocals)}"
+        )
+        run(
+            f"ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t {ffprobe_duration(in_wav):.3f} {shlex.quote(out_bgm)}"
+        )
+
 
 def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
     """
@@ -248,15 +311,22 @@ def mix_bgm_with_tts(bgm_wav: str, tts_wav: str, out_wav: str):
     """
     # tts가 모노라도 amix가 알아서 섞습니다.
     run(
-        'ffmpeg -y -i {bgm} -i {tts} -filter_complex '
+        "ffmpeg -y -i {bgm} -i {tts} -filter_complex "
         '"[0:a][1:a]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
         ' [duck][1:a]amix=inputs=2:duration=first:dropout_transition=0" '
-        '-ar 48000 -ac 2 {out}'.format(
+        "-ar 48000 -ac 2 {out}".format(
             bgm=shlex.quote(bgm_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
         )
     )
 
-def mask_keep_intervals(in_wav: str, keep: list[tuple[float, float]], out_wav: str, sr: int = 48000, ac: int = 2):
+
+def mask_keep_intervals(
+    in_wav: str,
+    keep: list[tuple[float, float]],
+    out_wav: str,
+    sr: int = 48000,
+    ac: int = 2,
+):
     """
     keep 구간만 원본 레벨 그대로 두고, 그 외는 볼륨 0으로 '침묵화'하여 길이를 보존.
     ffmpeg volume 필터의 enable를 이용해 not(keep)을 0으로 만듦.
@@ -269,15 +339,18 @@ def mask_keep_intervals(in_wav: str, keep: list[tuple[float, float]], out_wav: s
 
     if not keep:
         # 전부 비-스피치: 전체 길이 무음
-        run(f"ffmpeg -y -f lavfi -i anullsrc=channel_layout={'stereo' if ac==2 else 'mono'}:sample_rate={sr} -t {dur:.6f} -ar {sr} -ac {ac} {shlex.quote(out_wav)}")
+        run(
+            f"ffmpeg -y -f lavfi -i anullsrc=channel_layout={'stereo' if ac==2 else 'mono'}:sample_rate={sr} -t {dur:.6f} -ar {sr} -ac {ac} {shlex.quote(out_wav)}"
+        )
         return
 
     expr = "+".join([f"between(t,{s:.6f},{e:.6f})" for s, e in keep])
     # keep 외 구간은 볼륨 0 → 타임라인 보존
     run(
-        f'ffmpeg -y -i {shlex.quote(in_wav)} '
-        f'-af "volume=0:enable=\'not({expr})\'" -ar {sr} -ac {ac} {shlex.quote(out_wav)}'
+        f"ffmpeg -y -i {shlex.quote(in_wav)} "
+        f"-af \"volume=0:enable='not({expr})'\" -ar {sr} -ac {ac} {shlex.quote(out_wav)}"
     )
+
 
 def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
     """
@@ -285,13 +358,67 @@ def mix_bgm_fx_with_tts(bgm_wav: str, fx_wav: str, tts_wav: str, out_wav: str):
     결과는 48k 스테레오.
     """
     run(
-        'ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex '
+        "ffmpeg -y -i {bgm} -i {fx} -i {tts} -filter_complex "
         '"[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0,'
-        'aformat=channel_layouts=stereo[bed];'
-        ' [2:a]pan=stereo|c0=c0|c1=c0,asplit=2[tts_sc][tts_mix];'
-        ' [bed][tts_sc]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];'
+        "aformat=channel_layouts=stereo[bed];"
+        " [2:a]pan=stereo|c0=c0|c1=c0,asplit=2[tts_sc][tts_mix];"
+        " [bed][tts_sc]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[duck];"
         ' [duck][tts_mix]amix=inputs=2:duration=first:dropout_transition=0" '
-        '-ar 48000 -ac 2 {out}'.format(
-            bgm=shlex.quote(bgm_wav), fx=shlex.quote(fx_wav), tts=shlex.quote(tts_wav), out=shlex.quote(out_wav)
+        "-ar 48000 -ac 2 {out}".format(
+            bgm=shlex.quote(bgm_wav),
+            fx=shlex.quote(fx_wav),
+            tts=shlex.quote(tts_wav),
+            out=shlex.quote(out_wav),
         )
+    )
+
+
+def detect_mean_volume_db(path: str) -> float | None:
+    """
+    ffmpeg volumedetect 필터로 평균 음압 레벨(RMS, dB)을 추정한다.
+    """
+    if not os.path.exists(path):
+        return None
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostats",
+        "-i",
+        path,
+        "-af",
+        "volumedetect",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    if proc.returncode != 0:
+        return None
+    for line in proc.stderr.splitlines():
+        if "mean_volume" in line:
+            try:
+                value = line.split("mean_volume:")[1].split("dB")[0].strip()
+                return float(value)
+            except (IndexError, ValueError):
+                continue
+    return None
+
+
+def apply_gain_db(
+    in_path: str,
+    out_path: str,
+    gain_db: float,
+    *,
+    ar: int = 24000,
+    ac: int = 1,
+) -> None:
+    """
+    주어진 오디오 파일에 dB 단위 게인을 적용한다.
+    """
+    run(
+        f"ffmpeg -y -i {shlex.quote(in_path)} "
+        f'-af "volume={gain_db:+.4f}dB" '
+        f"-ar {ar} -ac {ac} {shlex.quote(out_path)}"
     )
