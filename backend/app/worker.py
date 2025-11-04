@@ -300,11 +300,36 @@ class QueueWorker:
         video_src = meta.get("input")
 
         def _cut_if_possible(
-            src: Optional[str], dst: str, start: float, end: float
+            src: Optional[str],
+            dst: str,
+            start: float,
+            end: float,
+            *,
+            sample_rate: Optional[int] = None,
+            channels: Optional[int] = None,
         ) -> bool:
             if not src or not os.path.exists(src):
                 return False
-            cut_wav_segment(src, dst, start, end, ar=48000)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{start:.6f}",
+                "-to",
+                f"{end:.6f}",
+                "-i",
+                shlex.quote(src),
+            ]
+            if sample_rate:
+                cmd.extend(["-ar", str(sample_rate)])
+            if channels:
+                cmd.extend(["-ac", str(channels)])
+            if sample_rate or channels:
+                cmd.extend(["-c:a", "pcm_s16le"])
+            else:
+                cmd.extend(["-c", "copy"])
+            cmd.append(shlex.quote(dst))
+            run(" ".join(cmd))
             return True
 
         for idx, seg in enumerate(segments):
@@ -321,7 +346,9 @@ class QueueWorker:
 
             # 원본 발화
             local_source = os.path.join(segment_dir, f"{base_name}_source.wav")
-            has_source = _cut_if_possible(speech_src, local_source, start, end)
+            has_source = _cut_if_possible(
+                speech_src, local_source, start, end, sample_rate=16000, channels=1
+            )
             if has_source:
                 source_key = f"{prefix}/{base_name}_source.wav"
                 self._upload_file(local_source, source_key, "audio/wav")
@@ -329,7 +356,9 @@ class QueueWorker:
 
             # BGM
             local_bgm = os.path.join(segment_dir, f"{base_name}_bgm.wav")
-            has_bgm = _cut_if_possible(bgm_src, local_bgm, start, end)
+            has_bgm = _cut_if_possible(
+                bgm_src, local_bgm, start, end, sample_rate=48000, channels=2
+            )
             if has_bgm:
                 bgm_key = f"{prefix}/{base_name}_bgm.wav"
                 self._upload_file(local_bgm, bgm_key, "audio/wav")
@@ -337,7 +366,9 @@ class QueueWorker:
 
             # 합성 음성
             local_tts = os.path.join(segment_dir, f"{base_name}_tts.wav")
-            has_tts = _cut_if_possible(tts_src, local_tts, start, end)
+            has_tts = _cut_if_possible(
+                tts_src, local_tts, start, end, sample_rate=48000, channels=1
+            )
             if has_tts:
                 tts_key = f"{prefix}/{base_name}_tts.wav"
                 self._upload_file(local_tts, tts_key, "audio/wav")
@@ -346,7 +377,9 @@ class QueueWorker:
             # 배경음이 섞인 최종 믹스(없으면 TTS로 폴백)
             local_mix = os.path.join(segment_dir, f"{base_name}_mix.wav")
             mix_created = False
-            if final_mix_src and _cut_if_possible(final_mix_src, local_mix, start, end):
+            if final_mix_src and _cut_if_possible(
+                final_mix_src, local_mix, start, end, sample_rate=48000, channels=2
+            ):
                 mix_created = True
             elif (
                 has_bgm
@@ -361,7 +394,9 @@ class QueueWorker:
                     logger.warning(
                         "Failed to create bgm mix for segment %s: %s", base_name, exc
                     )
-            elif mix_src and _cut_if_possible(mix_src, local_mix, start, end):
+            elif mix_src and _cut_if_possible(
+                mix_src, local_mix, start, end, sample_rate=48000, channels=2
+            ):
                 mix_created = True
 
             if mix_created and os.path.exists(local_mix):
@@ -696,7 +731,7 @@ class QueueWorker:
                         )
 
                 bgm_gain = (
-                    segment_payload.get("bgm_gain") or assets.get("bgm_gain") or 1.0
+                    segment_payload.get("bgm_gain") or assets.get("bgm_gain") or 1.4
                 )
                 tts_mix_gain = (
                     segment_payload.get("tts_gain") or assets.get("tts_gain") or 1.0
