@@ -30,7 +30,7 @@ source "$VENV_DIR/bin/activate"
 
 pip install --upgrade pip
 
-REQ_FILE="requirements.txt"
+REQ_FILE="$ARCHIVE_ROOT/requirements.txt"
 
 echo "Installing dependencies from $REQ_FILE..."
 if [ -f "$REQ_FILE" ]; then
