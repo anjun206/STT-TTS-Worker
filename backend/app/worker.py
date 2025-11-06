@@ -153,7 +153,7 @@ def _build_segment_payload(
                 "end_point": end,
                 "editor_id": None,
                 "translate_context": translation_text,
-                "sub_langth": length,
+                "sub_length": length,
                 "issues": seg.get("issues", []),
                 # legacy keys (for compatibility with older consumers)
                 "seg_id": seg.get("seg_id", idx),
@@ -218,6 +218,7 @@ class QueueWorker:
                     WaitTimeSeconds=self.poll_wait,
                     VisibilityTimeout=self.visibility_timeout,
                     MessageAttributeNames=["All"],
+                    AttributeNames=["All"],
                 )
             except (BotoCoreError, ClientError) as exc:
                 logger.error("Failed to poll SQS: %s", exc)
@@ -226,6 +227,12 @@ class QueueWorker:
 
             for msg in messages.get("Messages", []):
                 receipt = msg["ReceiptHandle"]
+                rc = int(msg.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
+                logger.info(
+                    "SQS received (ReceiveCount=%s, MessageId=%s)",
+                    rc,
+                    msg.get("MessageId"),
+                )
                 try:
                     body = json.loads(msg.get("Body", "{}"))
                 except json.JSONDecodeError:
@@ -242,8 +249,11 @@ class QueueWorker:
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception("Unexpected error handling message: %s", exc)
 
-                if success:
-                    self._delete_message(receipt)
+                finally:
+                    self.sqs.delete_message(
+                        QueueUrl=self.queue_url, ReceiptHandle=receipt
+                    )
+                    logger.info("SQS deleted: %s", msg.get("MessageId"))
 
     def _delete_message(self, receipt: str) -> None:
         try:
@@ -254,12 +264,13 @@ class QueueWorker:
     def _handle_job(self, payload: Dict[str, Any]) -> None:
         task = (payload.get("task") or "full_pipeline").lower()
 
-        if task == "full_pipeline":
+        if task == "full_pipeline":  # preTTS
             self._handle_full_pipeline(payload)
         elif task == "segment_tts":
             self._handle_segment_tts(payload)
         elif task in {"segment_mix", "tts_bgm_mix"}:
             self._handle_segment_mix(payload)
+            # 최종 TTS + mix -> 최종 결과물 나오는 ~ handle_최종 어쩌구 저쩌구(payload) 필요
         else:
             raise JobProcessingError(f"Unsupported task type: {task}")
 
@@ -453,17 +464,46 @@ class QueueWorker:
             )
             self.s3.download_file(self.bucket, input_key, local_input)
             self._post_status(
-                callback_url, "in_progress", metadata={"stage": "downloaded"}
+                callback_url,
+                "in_progress",
+                stage_id="asr",
+                stage_status="processing",
+                project_id=project_id,
+                metadata={
+                    "stage": "downloaded",
+                    "job_id": job_id,
+                    "project_id": project_id,
+                },
             )
+
             meta = _run_asr_stage(job_id, local_input)
+            self._post_status(
+                callback_url, "in_progress", metadata={"stage": "stt_completed"}
+            )
+            self._post_status(
+                callback_url, "in_progress", metadata={"stage": "mt_prepare"}
+            )
             translations = translate_stage(
                 meta["segments"], src=source_lang, tgt=target_lang
             )
             meta["translations"] = translations
             save_meta(workdir, meta)
             self._post_status(
-                callback_url, "in_progress", metadata={"stage": "tts_prepare"}
+                callback_url, "in_progress", metadata={"stage": "mt_completed"}
             )
+            self._post_status(
+                callback_url,
+                "in_progress",
+                stage_id="tts",
+                stage_status="processing",
+                project_id=project_id,
+                metadata={
+                    "stage": "tts_prepare",
+                    "job_id": job_id,
+                    "project_id": project_id,
+                },
+            )
+
             asyncio.run(tts_finalize_stage(job_id, target_lang, None))
             output_path = mux_stage(job_id)
             meta = load_meta(workdir)
@@ -496,7 +536,7 @@ class QueueWorker:
                 ContentType="application/json",
             )
             status_payload = {
-                "stage": "completed",
+                "stage": "tts_completed",
                 "segments_count": len(segments_payload),
                 "segments": segments_payload,
                 "metadata_key": metadata_key,
@@ -511,6 +551,9 @@ class QueueWorker:
             self._post_status(
                 callback_url,
                 "done",
+                stage_id="mux",
+                stage_status="done",
+                project_id=project_id,
                 result_key=result_key,
                 metadata=status_payload,
             )
@@ -567,6 +610,9 @@ class QueueWorker:
             self._post_status(
                 callback_url,
                 "in_progress",
+                stage_id="segment_tts",
+                stage_status="processing",
+                project_id=project_id,
                 metadata={
                     "stage": "segment_tts_started",
                     "job_id": job_id,
@@ -797,7 +843,14 @@ class QueueWorker:
             if project_id:
                 metadata["project_id"] = project_id
 
-            self._post_status(callback_url, "done", metadata=metadata)
+            self._post_status(
+                callback_url,
+                "done",
+                stage_id="segment_tts",
+                stage_status="done",
+                project_id=project_id,
+                metadata=metadata,
+            )
 
         except (BotoCoreError, ClientError) as exc:
             failure = JobProcessingError(f"AWS client error: {exc}")
@@ -828,6 +881,9 @@ class QueueWorker:
             self._post_status(
                 callback_url,
                 "in_progress",
+                stage_id="segment_mix",
+                stage_status="processing",
+                project_id=project_id,
                 metadata={
                     "stage": "segment_mix_started",
                     "job_id": job_id,
@@ -910,6 +966,9 @@ class QueueWorker:
             self._post_status(
                 callback_url,
                 "done",
+                stage_id="segment_mix",
+                stage_status="done",
+                project_id=project_id,
                 metadata={
                     "stage": "segment_mix_completed",
                     "job_id": job_id,
@@ -929,11 +988,19 @@ class QueueWorker:
             self._safe_fail(callback_url, wrapped)
             raise wrapped
 
-    def _safe_fail(self, callback_url: str, error: JobProcessingError) -> None:
+    def _safe_fail(
+        self,
+        callback_url: str,
+        error: JobProcessingError,
+        *,
+        stage_id: str = "pipeline",
+    ) -> None:
         try:
             self._post_status(
                 callback_url,
                 "failed",
+                stage_id=stage_id,
+                stage_status="failed",
                 error=str(error),
                 metadata={"stage": "failed"},
             )
@@ -948,8 +1015,20 @@ class QueueWorker:
         result_key: Optional[str] = None,
         error: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        stage_id: Optional[str] = None,
+        stage_status: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> None:
-        payload: Dict[str, Any] = {"status": status}
+        stage_id = stage_id or "pipeline"
+        stage_status = stage_status or ("done" if status == "done" else "processing")
+
+        payload: Dict[str, Any] = {
+            "status": status,
+            "stage_id": stage_id,
+            "stage_status": stage_status,
+        }
+        if project_id is not None:
+            payload["project_id"] = project_id
         if result_key is not None:
             payload["result_key"] = result_key
         if error is not None:
