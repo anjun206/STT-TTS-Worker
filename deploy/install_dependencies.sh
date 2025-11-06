@@ -8,15 +8,23 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 ARCHIVE_ROOT=$( dirname "$SCRIPT_DIR" )
 # ---
 sudo apt-get update -y
-sudo apt-get install -y python3-venv jq
-
-# 2-1. Python interpreter 선택 (3.11이 있으면 우선 사용)
-PYTHON_BIN=$(command -v python3.11 || command -v python3)
-if [ -z "$PYTHON_BIN" ]; then
-    echo "ERROR: python3 interpreter not found."
-    exit 1
+if sudo apt-get install -y python3.11 python3.11-venv jq; then
+    PYTHON_BIN=$(command -v python3.11)
+    if [ -z "$PYTHON_BIN" ]; then
+        echo "ERROR: python3.11 installed but binary not found."
+        exit 1
+    fi
+    echo "Using Python interpreter: $PYTHON_BIN"
+else
+    echo "WARNING: python3.11 packages unavailable. Falling back to system python3."
+    sudo apt-get install -y python3 python3-venv jq
+    PYTHON_BIN=$(command -v python3)
+    if [ -z "$PYTHON_BIN" ]; then
+        echo "ERROR: python3 interpreter not found."
+        exit 1
+    fi
+    echo "Using Python interpreter: $PYTHON_BIN"
 fi
-echo "Using Python interpreter: $PYTHON_BIN"
 
 # 3. venv가 설치될 최종 목적지
 APP_DIR="/home/ubuntu/app"
@@ -28,7 +36,7 @@ if [ -d "$VENV_DIR" ]; then
     rm -rf "$VENV_DIR"
 fi
 echo "Create APP directory: $APP_DIR"
-mkdir -p $APP_DIR
+mkdir -p "$APP_DIR"
 
 echo "Create APP venv: $VENV_DIR..."
 "$PYTHON_BIN" -m venv "$VENV_DIR"

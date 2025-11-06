@@ -1,4 +1,14 @@
 #!/bin/bash
+<<<<<<< HEAD
+
+echo "Stopping worker process..."
+
+WORKER_PATTERN="python -u app/worker.py"
+
+# pgrep은 찾은 PID를 줄 단위로 출력하므로 공백 분리 가능
+PIDS=$(pgrep -f "$WORKER_PATTERN" || true)
+
+=======
 # start_server.sh에서 실행한 uvicorn 프로세스를 찾아서 종료합니다.
 # 'pkill -f'는 전체 명령어 라인('uvicorn main:app ...')을 검색합니다.
 echo "Stopping worker process..."
@@ -12,6 +22,7 @@ WORKER_PATTERN="python -u app/worker.py"
 # 끝나도록 보장해주는 필수 장치입니다.
 # pgrep은 찾은 PID를 줄 단위로 출력하므로 공백 분리 가능
 PIDS=$(pgrep -f "$WORKER_PATTERN" || true)
+>>>>>>> main
 if [ -z "$PIDS" ]; then
     echo "No worker process found (already stopped?)."
 else
@@ -21,6 +32,10 @@ else
             echo "Sent SIGTERM to PID $PID"
         fi
     done
+<<<<<<< HEAD
+
+=======
+>>>>>>> main
     # 잠시 대기 후 잔존 PID 확인
     sleep 2
     REMAINING=$(pgrep -f "$WORKER_PATTERN" || true)
@@ -29,6 +44,11 @@ else
         kill -9 $REMAINING 2>/dev/null || true
     fi
 fi
+<<<<<<< HEAD
+
+echo "Life Cycle - ApplicationStop: complete."
+=======
 echo "서버 중지 명령이 실행되었습니다."
 echo "Life Cycle - ApplicationStop: complete."
 echo "Life Cycle - ApplicationStop: complete."
+>>>>>>> main

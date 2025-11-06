@@ -25,7 +25,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       # 3. 소스 코드를 zip 파일로 압축 (appspec.yml 포함)
       - name: Create deployment package
