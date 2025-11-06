@@ -5,10 +5,8 @@ import json
 import shutil
 import shlex
 from typing import Optional, List, Dict
-
 from faster_whisper import WhisperModel
 from fastapi import UploadFile
-
 from .translate import translate_texts
 from .tts import synthesize
 from .utils import (
