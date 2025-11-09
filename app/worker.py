@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -194,6 +195,11 @@ class QueueWorker:
             "projects/{project_id}/interim/{job_id}/segments",
         )
         self.visibility_timeout = int(os.getenv("JOB_VISIBILITY_TIMEOUT", "300"))
+        self.visibility_multiplier = float(
+            os.getenv("JOB_VISIBILITY_MULTIPLIER", "1.8")
+        )
+        self.visibility_padding = int(os.getenv("JOB_VISIBILITY_PADDING", "60"))
+        self.visibility_max = int(os.getenv("JOB_VISIBILITY_MAX", "43200"))
         self.poll_wait = int(os.getenv("JOB_QUEUE_WAIT", "20"))
         self.callback_localhost_host = os.getenv(
             "JOB_CALLBACK_LOCALHOST_HOST", "host.docker.internal"
@@ -242,7 +248,7 @@ class QueueWorker:
 
                 success = False
                 try:
-                    self._handle_job(body)
+                    self._handle_job(body, receipt)
                     success = True
                 except JobProcessingError as exc:
                     logger.error("Job %s failed: %s", body.get("job_id"), exc)
@@ -250,10 +256,15 @@ class QueueWorker:
                     logger.exception("Unexpected error handling message: %s", exc)
 
                 finally:
-                    self.sqs.delete_message(
-                        QueueUrl=self.queue_url, ReceiptHandle=receipt
-                    )
-                    logger.info("SQS deleted: %s", msg.get("MessageId"))
+                    if success:
+                        self._delete_message(receipt)
+                        logger.info("SQS deleted: %s", msg.get("MessageId"))
+                    else:
+                        logger.warning(
+                            "Job %s failed; leaving message %s for retry",
+                            body.get("job_id"),
+                            msg.get("MessageId"),
+                        )
 
     def _delete_message(self, receipt: str) -> None:
         try:
@@ -261,15 +272,50 @@ class QueueWorker:
         except (BotoCoreError, ClientError) as exc:
             logger.error("Failed to delete SQS message: %s", exc)
 
-    def _handle_job(self, payload: Dict[str, Any]) -> None:
+    def _maybe_extend_visibility(
+        self, receipt: Optional[str], duration_hint: Optional[float]
+    ) -> None:
+        if not receipt or not duration_hint or duration_hint <= 0:
+            return
+
+        target_timeout = int(
+            min(
+                self.visibility_max,
+                max(
+                    self.visibility_timeout,
+                    math.ceil(duration_hint * self.visibility_multiplier)
+                    + self.visibility_padding,
+                ),
+            )
+        )
+        if target_timeout <= self.visibility_timeout:
+            return
+
+        try:
+            self.sqs.change_message_visibility(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=receipt,
+                VisibilityTimeout=target_timeout,
+            )
+            logger.info(
+                "Extended message visibility to %s seconds (duration hint %.2fs)",
+                target_timeout,
+                duration_hint,
+            )
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("Failed to extend message visibility: %s", exc)
+
+    def _handle_job(
+        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
+    ) -> None:
         task = (payload.get("task") or "full_pipeline").lower()
 
         if task == "full_pipeline":  # preTTS
-            self._handle_full_pipeline(payload)
+            self._handle_full_pipeline(payload, receipt_handle)
         elif task == "segment_tts":
-            self._handle_segment_tts(payload)
+            self._handle_segment_tts(payload, receipt_handle)
         elif task in {"segment_mix", "tts_bgm_mix"}:
-            self._handle_segment_mix(payload)
+            self._handle_segment_mix(payload, receipt_handle)
             # 최종 TTS + mix -> 최종 결과물 나오는 ~ handle_최종 어쩌구 저쩌구(payload) 필요
         else:
             raise JobProcessingError(f"Unsupported task type: {task}")
@@ -446,7 +492,9 @@ class QueueWorker:
 
         save_meta(workdir, meta)
 
-    def _handle_full_pipeline(self, payload: Dict[str, Any]) -> None:
+    def _handle_full_pipeline(
+        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
+    ) -> None:
         job_id = payload.get("job_id")
         project_id = payload.get("project_id")
         input_key = payload.get("input_key")
@@ -463,6 +511,13 @@ class QueueWorker:
                 "Downloading s3://%s/%s to %s", self.bucket, input_key, local_input
             )
             self.s3.download_file(self.bucket, input_key, local_input)
+            duration_hint: Optional[float] = None
+            try:
+                duration_hint = ffprobe_duration(local_input)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Failed to probe duration for %s: %s", local_input, exc)
+            else:
+                self._maybe_extend_visibility(receipt_handle, duration_hint)
             self._post_status(
                 callback_url,
                 "in_progress",
@@ -569,7 +624,9 @@ class QueueWorker:
             self._safe_fail(callback_url, wrapped)
             raise wrapped
 
-    def _handle_segment_tts(self, payload: Dict[str, Any]) -> None:
+    def _handle_segment_tts(
+        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
+    ) -> None:
         job_id = payload.get("job_id")
         callback_url = payload.get("callback_url")
         segment_payload: Dict[str, Any] = payload.get("segment") or {}
@@ -864,7 +921,9 @@ class QueueWorker:
             self._safe_fail(callback_url, wrapped)
             raise wrapped
 
-    def _handle_segment_mix(self, payload: Dict[str, Any]) -> None:
+    def _handle_segment_mix(
+        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
+    ) -> None:
         job_id = payload.get("job_id")
         callback_url = payload.get("callback_url")
         if not job_id or not callback_url:

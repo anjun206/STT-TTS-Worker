@@ -1,13 +1,14 @@
 services:
   dub:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
     container_name: ai-dub
     gpus: all
     env_file:
       - ./.env.prod
     environment:
+      APP_MODE: "worker"
       SEPARATE_BGM: "1"
       USE_GPU: "1"
       TTS_DEVICE: "cuda"
@@ -37,5 +38,6 @@ services:
       - ./data/hf_cache:/app/cache/hf
       - ./data/tts_cache:/app/cache/tts
       - ./data/demucs_cache:/app/cache/demucs
+    ports:
+      - "${APP_PORT:-8000}:8000"
     shm_size: "2gb"
-    command: python -m app.worker

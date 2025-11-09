@@ -75,13 +75,22 @@ SQS 큐를 구독해 영상 더빙 파이프라인과 세그먼트별 오디오 
 - 그 외 `VAD_AGGR`, `VAD_FRAME_MS`, `STT_INTERVAL_MARGIN` 등 파이프라인 튜닝 옵션
 
 ## 실행 방법
+### 1) SQS 워커 (기존)
 ```bash
-# 루트에서 워커와 의존 서비스 실행
 docker compose build
-docker compose up
+docker compose up          # APP_MODE=worker (default)
 ```
 
-워커 컨테이너는 `/app/data` 볼륨에 중간 산출물을 캐시합니다. `data/` 디렉터리를 정리하면 디스크를 확보할 수 있습니다.
+### 2) 단독 테스트 API (STT/TTS 실험)
+```bash
+docker compose build
+docker compose run --rm --service-ports \
+  -e APP_MODE=api \
+  dub
+```
+로컬에서 `http://localhost:8000/docs`에 접속해 `/dub`, `/tts-single`, `/asr` 등 엔드포인트를 바로 호출할 수 있습니다.
+
+워커/테스트 모드 공통으로 컨테이너는 `/app/data` 볼륨에 중간 산출물을 캐시합니다. `data/` 디렉터리를 정리하면 디스크를 확보할 수 있습니다.
 
 ## 개발 시 참고
 - 새 작업 유형을 추가하려면 큐 메시지의 `task`와 필요한 필드를 정의하고, 워커에 대응 메서드를 구현한 뒤 `_handle_job`에서 분기하십시오.
