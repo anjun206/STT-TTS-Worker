@@ -1,27 +1,20 @@
 #!/bin/bash
-# start_server.sh에서 실행한 uvicorn 프로세스를 찾아서 종료합니다.
-# 'pkill -f'는 전체 명령어 라인('uvicorn main:app ...')을 검색합니다.
-echo "Stopping worker process..."
-echo "FastAPI (uvicorn) 서버를 중지합니다..."
-WORKER_PATTERN="python -u app/worker.py"
-PIDS=$(pgrep -f "$WORKER_PATTERN" || true)
+set -euo pipefail
 
-if [ -z "$PIDS" ]; then
-    echo "No worker process found (already stopped?)."
-else
-    echo "Worker PID(s) detected: $PIDS"
-    for PID in $PIDS; do
-        if kill "$PID" 2>/dev/null; then
-            echo "Sent SIGTERM to PID $PID"
-        fi
-    done
-    # 잠시 대기 후 잔존 PID 확인
-    sleep 2
-    REMAINING=$(pgrep -f "$WORKER_PATTERN" || true)
-    if [ -n "$REMAINING" ]; then
-        echo "Worker still running (PID: $REMAINING). Sending SIGKILL."
-        kill -9 $REMAINING 2>/dev/null || true
-    fi
+APP_DIR="/home/ubuntu/app"
+COMPOSE_FILE="$APP_DIR/docker-compose-prod.yml"
+
+if [ ! -f "$COMPOSE_FILE" ]; then
+  echo "docker compose 파일을 찾을 수 없습니다: $COMPOSE_FILE (이미 중지된 것으로 간주)"
+  exit 0
 fi
+
+echo "docker compose 로그 스트리머 종료..."
+pkill -f "docker compose -f $COMPOSE_FILE logs -f" >/dev/null 2>&1 || true
+
+cd "$APP_DIR"
+echo "Docker 스택 종료 중..."
+docker compose -f "$COMPOSE_FILE" down --remove-orphans || true
+
 echo "서버 중지 명령이 실행되었습니다."
 echo "Life Cycle - ApplicationStop: complete."

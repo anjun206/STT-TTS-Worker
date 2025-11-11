@@ -1,68 +1,24 @@
 #!/bin/bash
-APP_DIR="/home/ubuntu/app"
-
-# 2. 가상 환경(venv) 경로
-VENV_DIR="$APP_DIR/venv/bin/activate"
-
-# 3. (중요) 가상 환경 활성화
-#    BeforeInstall 단계에서 생성한 venv를 활성화합니다.
-echo "Activating virtual environment at $VENV_DIR..."
-if [ ! -f "$VENV_DIR" ]; then
-    echo "ERROR: Virtual environment not found at $VENV_DIR"
-    exit 1
-fi
-source "$VENV_DIR"
-
-# 4. 애플리케이션 코드가 있는 디렉토리로 이동
-cd $APP_DIR
-
-# 5. 워커 프로세스를 백그라운드로 실행
-LOG_DIR="$APP_DIR/logs"
-mkdir -p "$LOG_DIR"
-
-WORKER_LOG="$LOG_DIR/worker.log"
-WORKER_ERR_LOG="$LOG_DIR/worker_error.log"
-
-sudo touch "$WORKER_LOG" "$WORKER_ERR_LOG"
-
-echo "Starting worker process: python app/worker.py"
-nohup python -u app/worker.py > "$WORKER_LOG" 2> "$WORKER_ERR_LOG" &
-
-
-echo "Life Cycle - ApplicationStart: complete."
-<<<<<<< HEAD
-=======
-#!/bin/bash
-
+set -euo pipefail
 
 APP_DIR="/home/ubuntu/app"
+COMPOSE_FILE="$APP_DIR/docker-compose-prod.yml"
+LOG_FILE="$APP_DIR/app.log"
 
-# 2. 가상 환경(venv) 경로
-VENV_DIR="$APP_DIR/venv/bin/activate"
-
-# 3. (중요) 가상 환경 활성화
-#    BeforeInstall 단계에서 생성한 venv를 활성화합니다.
-echo "Activating virtual environment at $VENV_DIR..."
-if [ ! -f "$VENV_DIR" ]; then
-    echo "ERROR: Virtual environment not found at $VENV_DIR"
+if [ ! -f "$COMPOSE_FILE" ]; then
+    echo "ERROR: docker compose file not found: $COMPOSE_FILE"
     exit 1
 fi
-source "$VENV_DIR"
 
-# 4. 애플리케이션 코드가 있는 디렉토리로 이동
-cd $APP_DIR
+cd "$APP_DIR"
 
-# 시작 전 ingest 실행 (실패해도 서버는 계속 기동)
-# echo "Running glossary ingestion..."
-# python script/ingest.py || echo "WARNING: glossary ingestion failed (continuing startup)"
+echo "Stopping any existing docker compose log tail (if running)..."
+pkill -f "docker compose -f $COMPOSE_FILE logs -f" >/dev/null 2>&1 || true
 
-# 5. 워커 프로세스를 백그라운드로 실행
-WORKER_LOG="$APP_DIR/worker.log"
-WORKER_ERR_LOG="$APP_DIR/worker_error.log"
+echo "Starting Docker stack with $COMPOSE_FILE..."
+docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
-echo "Starting worker process: python app/worker.py"
-nohup python -u app/worker.py > "$WORKER_LOG" 2> "$WORKER_ERR_LOG" &
-
+echo "Streaming docker compose logs to $LOG_FILE..."
+nohup docker compose -f "$COMPOSE_FILE" logs -f > "$LOG_FILE" 2>&1 &
 
 echo "Life Cycle - ApplicationStart: complete."
->>>>>>> main
