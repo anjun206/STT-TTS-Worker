@@ -36,5 +36,5 @@ hooks:
 
   ApplicationStart:
     - location: deploy/start_server.sh # 새 서버 시작
-      timeout: 300
+      timeout: 1500
       runas: ubuntu
