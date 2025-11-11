@@ -1,1132 +1,226 @@
 import asyncio
 import json
 import logging
-import math
 import os
-import shlex
-import shutil
 import time
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, urlunparse
+from pathlib import Path
 
 import boto3
 import requests
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError, BotoCoreError
 
-from .pipeline import (
-    TTS_MODEL,
-    _annotate_segments,
-    _extract_tracks,
-    _whisper_transcribe,
-    generate_segment_clips,
-    mux_stage,
-    translate_stage,
-    tts_finalize_stage,
-)
-from .utils import (
-    cut_wav_segment,
-    concat_audio,
-    ffprobe_duration,
-    mask_keep_intervals,
-    mix_bgm_with_tts,
-    run,
-    trim_or_pad_to_duration,
-    detect_mean_volume_db,
-    apply_gain_db,
-)
-from .tts import synthesize
-from .utils_meta import load_meta, save_meta
-from .vad import (
-    complement_intervals,
-    merge_intervals,
-)
+# 워커의 서비스 모듈들
+from services.stt import run_asr
+from services.translate import translate_transcript
+from services.tts import generate_tts
+from services.sync import sync_segments
+from services.mux import mux_audio_video
+from config import ensure_job_dirs
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=os.getenv("WORKER_LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-)
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+noisy_loggers = ['boto3', 'botocore', 's3transfer', 'urllib3']
+for logger_name in noisy_loggers:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+# AWS 설정
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+JOB_QUEUE_URL = os.getenv("JOB_QUEUE_URL")
+AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
+
+if not all([JOB_QUEUE_URL, AWS_S3_BUCKET]):
+    raise ValueError("JOB_QUEUE_URL and AWS_S3_BUCKET environment variables must be set.")
+
+sqs_client = boto3.client("sqs", region_name=AWS_REGION)
+s3_client = boto3.client("s3", region_name=AWS_REGION)
 
 
-class JobProcessingError(Exception):
-    """Raised when a job fails irrecoverably during processing."""
+def send_callback(callback_url: str, status: str, message: str, stage: str | None = None, metadata: dict | None = None):
+    """백엔드로 진행 상황 콜백을 보냅니다."""
+    try:
+        payload = {"status": status, "message": message}
+        
+        # 메타데이터 구성
+        callback_metadata = metadata or {}
+        if stage:
+            callback_metadata["stage"] = stage
+        
+        if callback_metadata:
+            payload["metadata"] = callback_metadata
+
+        response = requests.post(callback_url, json=payload, timeout=10)
+        response.raise_for_status()
+        logging.info(f"Sent callback to {callback_url} with status: {status}, stage: {stage or 'N/A'}")
+    except requests.RequestException as e:
+        logging.error(f"Failed to send callback to {callback_url}: {e}")
 
 
-def _ensure_workdir(job_id: str) -> str:
-    workdir = os.path.join("/app/data", job_id)
-    os.makedirs(workdir, exist_ok=True)
-    return workdir
+def download_from_s3(bucket: str, key: str, local_path: Path) -> bool:
+    """S3에서 파일을 다운로드합니다."""
+    try:
+        logging.info(f"Downloading s3://{bucket}/{key} to {local_path}...")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        s3_client.download_file(bucket, key, str(local_path))
+        logging.info(f"Successfully downloaded s3://{bucket}/{key}")
+        return True
+    except ClientError as e:
+        logging.error(f"Failed to download from S3: {e}")
+        return False
 
 
-def _run_asr_stage(job_id: str, input_path: str) -> Dict[str, Any]:
-    """
-    Execute ASR pipeline for a given job and persist metadata.
-    """
-    workdir = _ensure_workdir(job_id)
-    full_48k, vocals_48k, bgm_48k, vocals_16k_raw = _extract_tracks(input_path, workdir)
-    total = ffprobe_duration(full_48k)
+def upload_to_s3(bucket: str, key: str, local_path: Path) -> bool:
+    """S3로 파일을 업로드합니다."""
+    try:
+        logging.info(f"Uploading {local_path} to s3://{bucket}/{key}...")
+        s3_client.upload_file(str(local_path), bucket, key)
+        logging.info(f"Successfully uploaded to s3://{bucket}/{key}")
+        return True
+    except ClientError as e:
+        logging.error(f"Failed to upload to S3: {e}")
+        return False
+    except FileNotFoundError:
+        logging.error(f"Local file not found for upload: {local_path}")
+        return False
 
-    segments = _whisper_transcribe(vocals_16k_raw)
 
-    backend = os.getenv("WHISPER_BACKEND", "whisperx").strip().lower()
-    default_margin = "0.00" if backend == "whisperx" else "0.10"
-    margin = float(os.getenv("STT_INTERVAL_MARGIN", default_margin))
-    stt_intervals = merge_intervals(
-        [
-            (
-                max(0.0, float(s["start"]) - margin),
-                min(float(total), float(s["end"]) + margin),
+def full_pipeline(job_details: dict):
+    """전체 더빙 파이프라인을 실행합니다."""
+    job_id = job_details["job_id"]
+    project_id = job_details["project_id"]
+    input_key = job_details["input_key"]
+    callback_url = job_details["callback_url"]
+    
+    target_lang = job_details.get("target_lang", "en") 
+    voice_config = job_details.get("voice_config")
+
+    send_callback(callback_url, "in_progress", f"Starting full pipeline for job {job_id}", stage="starting")
+
+    # 1. 로컬 작업 디렉토리 설정
+    paths = ensure_job_dirs(job_id)
+    source_video_path = paths.input_dir / Path(input_key).name
+
+    # 2. S3에서 원본 영상 다운로드
+    if not download_from_s3(AWS_S3_BUCKET, input_key, source_video_path):
+        send_callback(callback_url, "failed", "Failed to download source video from S3.", stage="download_failed")
+        return
+
+    # 3. voice_config에서 사용자 음성 샘플 다운로드 (필요 시)
+    user_voice_sample_path = None
+    if voice_config and voice_config.get("kind") == "s3" and voice_config.get("key"):
+        voice_key = voice_config["key"]
+        user_voice_sample_path = paths.interim_dir / Path(voice_key).name
+        if not download_from_s3(AWS_S3_BUCKET, voice_key, user_voice_sample_path):
+            send_callback(callback_url, "failed", f"Failed to download voice sample from S3 key: {voice_key}", stage="download_failed")
+            return
+        send_callback(callback_url, "in_progress", "Custom voice sample downloaded.", stage="downloaded")
+
+    try:
+        # 4. ASR (STT)
+        send_callback(callback_url, "in_progress", "Starting ASR...", stage="asr_started")
+        run_asr(job_id, source_video_path)
+        # ASR 결과물(compact transcript)을 S3에 업로드
+        from services.transcript_store import COMPACT_ARCHIVE_NAME
+        asr_result_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
+        upload_to_s3(AWS_S3_BUCKET, f"projects/{project_id}/interim/{job_id}/{COMPACT_ARCHIVE_NAME}", asr_result_path)
+        send_callback(callback_url, "in_progress", "ASR completed.", stage="asr_completed")
+
+        # 5. 번역
+        send_callback(callback_url, "in_progress", "Starting translation...", stage="translation_started")
+        translate_transcript(job_id, target_lang)
+        # 번역 결과물(translated.json)을 S3에 업로드
+        trans_result_path = paths.trg_sentence_dir / "translated.json"
+        upload_to_s3(AWS_S3_BUCKET, f"projects/{project_id}/interim/{job_id}/translated.json", trans_result_path)
+        send_callback(callback_url, "in_progress", "Translation completed.", stage="translation_completed")
+
+        # 6. TTS
+        send_callback(callback_url, "in_progress", "Starting TTS...", stage="tts_started")
+        generate_tts(job_id, target_lang, voice_sample_path=user_voice_sample_path)
+        # TTS 결과물(개별 wav 파일 및 segments.json)을 S3에 업로드
+        tts_dir = paths.vid_tts_dir
+        for tts_file in tts_dir.glob('**/*'):
+            if tts_file.is_file():
+                tts_key = f"projects/{project_id}/interim/{job_id}/tts/{tts_file.relative_to(tts_dir)}"
+                upload_to_s3(AWS_S3_BUCKET, str(tts_key), tts_file)
+        send_callback(callback_url, "in_progress", "TTS completed.", stage="tts_completed")
+
+        # 7. Sync
+        send_callback(callback_url, "in_progress", "Starting sync...", stage="sync_started")
+        sync_segments(job_id)
+        # Sync 결과물(synced 디렉토리)을 S3에 업로드
+        synced_dir = paths.vid_tts_dir / "synced"
+        for sync_file in synced_dir.glob('**/*'):
+            if sync_file.is_file():
+                sync_key = f"projects/{project_id}/interim/{job_id}/synced/{sync_file.relative_to(synced_dir)}"
+                upload_to_s3(AWS_S3_BUCKET, str(sync_key), sync_file)
+        send_callback(callback_url, "in_progress", "Sync completed.", stage="sync_completed")
+
+        # 8. Mux
+        send_callback(callback_url, "in_progress", "Starting mux...", stage="mux_started")
+        mux_results = mux_audio_video(job_id, source_video_path)
+        output_video_path = Path(mux_results["output_video"])
+        
+        # 9. 최종 결과물 S3에 업로드
+        output_key = f"projects/{project_id}/outputs/{job_id}/{output_video_path.name}"
+        if not upload_to_s3(AWS_S3_BUCKET, output_key, output_video_path):
+             raise Exception("Failed to upload final video to S3")
+        
+        send_callback(callback_url, "done", "Pipeline completed successfully.", stage="done", metadata={"result_key": output_key})
+
+    except Exception as e:
+        logging.error(f"Pipeline failed for job {job_id}: {e}", exc_info=True)
+        send_callback(callback_url, "failed", str(e), stage="failed")
+
+
+async def poll_sqs():
+    """SQS 큐를 폴링하여 메시지를 처리합니다."""
+    logging.info("Starting SQS poller...")
+    while True:
+        try:
+            response = sqs_client.receive_message(
+                QueueUrl=JOB_QUEUE_URL,
+                MaxNumberOfMessages=1,
+                WaitTimeSeconds=20,
+                MessageAttributeNames=['All']
             )
-            for s in segments
-            if float(s["end"]) > float(s["start"])
-        ]
-    )
 
-    speech_only_48k = os.path.join(workdir, "speech_only_48k.wav")
-    vocals_fx_48k = os.path.join(workdir, "vocals_fx_48k.wav")
-    mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
-    nonspeech_intervals = complement_intervals(stt_intervals, total)
-    mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
-
-    wav_16k = os.path.join(workdir, "speech_16k.wav")
-    run(
-        f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}"
-    )
-
-    for i in range(len(segments)):
-        if i < len(segments) - 1:
-            st = float(segments[i]["end"])
-            en = float(segments[i + 1]["start"])
-            gap = max(0.0, en - st)
-            segments[i]["gap_after_vad"] = gap
-            segments[i]["gap_after"] = gap
-        else:
-            segments[i]["gap_after_vad"] = 0.0
-            segments[i]["gap_after"] = 0.0
-
-    _annotate_segments(segments)
-
-    meta = {
-        "job_id": job_id,
-        "workdir": workdir,
-        "input": input_path,
-        "audio_full_48k": full_48k,
-        "vocals_48k": vocals_48k,
-        "bgm_48k": bgm_48k,
-        "speech_only_48k": speech_only_48k,
-        "vocals_fx_48k": vocals_fx_48k,
-        "wav_16k": wav_16k,
-        "orig_duration": total,
-        "segments": segments,
-        "silences": [],
-        "speech_intervals_stt": stt_intervals,
-        "nonspeech_intervals_stt": nonspeech_intervals,
-    }
-    clips = generate_segment_clips(meta)
-    if clips:
-        meta["segment_original_assets"] = clips
-    save_meta(workdir, meta)
-    return meta
-
-
-def _build_segment_payload(
-    meta: Dict[str, Any], translations: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    payload: List[Dict[str, Any]] = []
-    segs = meta.get("segments") or []
-    for idx, seg in enumerate(segs):
-        start = float(seg.get("start", 0.0))
-        end = float(seg.get("end", 0.0))
-        length = seg.get("length")
-        if length is None:
-            length = max(0.0, end - start)
-        translation_text = ""
-        if idx < len(translations):
-            translation_text = translations[idx].get("text", "")
-        assets = seg.get("assets") or {}
-        payload.append(
-            {
-                "segment_id": str(seg.get("seg_id", idx)),
-                "segment_text": seg.get("text", ""),
-                "score": seg.get("score"),
-                "start_point": start,
-                "end_point": end,
-                "editor_id": None,
-                "translate_context": translation_text,
-                "sub_length": length,
-                "issues": seg.get("issues", []),
-                # legacy keys (for compatibility with older consumers)
-                "seg_id": seg.get("seg_id", idx),
-                "seg_txt": seg.get("text", ""),
-                "start": start,
-                "end": end,
-                "length": length,
-                "editor": None,
-                "trans_txt": translation_text,
-                "assets": assets,
-                "source_key": seg.get("source_key") or assets.get("source_key"),
-                "bgm_key": seg.get("bgm_key") or assets.get("bgm_key"),
-                "tts_key": seg.get("tts_key") or assets.get("tts_key"),
-                "mix_key": seg.get("mix_key") or assets.get("mix_key"),
-                "video_key": seg.get("video_key") or assets.get("video_key"),
-            }
-        )
-    return payload
-
-
-class QueueWorker:
-    def __init__(self) -> None:
-        self.queue_url = os.environ["JOB_QUEUE_URL"]
-        self.bucket = os.environ["AWS_S3_BUCKET"]
-        self.region = os.getenv("AWS_REGION", "ap-northeast-2")
-        self.default_target_lang = os.getenv("JOB_TARGET_LANG", "en")
-        self.default_source_lang = os.getenv("JOB_SOURCE_LANG", "ko")
-        self.result_video_prefix = os.getenv(
-            "JOB_RESULT_VIDEO_PREFIX",
-            "projects/{project_id}/outputs/videos/{job_id}.mp4",
-        )
-        self.result_meta_prefix = os.getenv(
-            "JOB_RESULT_METADATA_PREFIX",
-            "projects/{project_id}/outputs/metadata/{job_id}.json",
-        )
-        self.interim_segment_prefix = os.getenv(
-            "JOB_INTERIM_SEGMENT_PREFIX",
-            "projects/{project_id}/interim/{job_id}/segments",
-        )
-        self.visibility_timeout = int(os.getenv("JOB_VISIBILITY_TIMEOUT", "300"))
-        self.visibility_multiplier = float(
-            os.getenv("JOB_VISIBILITY_MULTIPLIER", "1.8")
-        )
-        self.visibility_padding = int(os.getenv("JOB_VISIBILITY_PADDING", "60"))
-        self.visibility_max = int(os.getenv("JOB_VISIBILITY_MAX", "43200"))
-        self.poll_wait = int(os.getenv("JOB_QUEUE_WAIT", "20"))
-        self.callback_localhost_host = os.getenv(
-            "JOB_CALLBACK_LOCALHOST_HOST", "host.docker.internal"
-        )
-
-        session_kwargs: Dict[str, Any] = {}
-        profile = os.getenv("AWS_PROFILE")
-        if profile:
-            session_kwargs["profile_name"] = profile
-        self.boto_session = boto3.Session(region_name=self.region, **session_kwargs)
-        self.sqs = self.boto_session.client("sqs", region_name=self.region)
-        self.s3 = self.boto_session.client("s3", region_name=self.region)
-        self.http = requests.Session()
-
-    def poll_forever(self) -> None:
-        logger.info("Starting SQS poller for queue %s", self.queue_url)
-        while True:
-            try:
-                messages = self.sqs.receive_message(
-                    QueueUrl=self.queue_url,
-                    MaxNumberOfMessages=1,
-                    WaitTimeSeconds=self.poll_wait,
-                    VisibilityTimeout=self.visibility_timeout,
-                    MessageAttributeNames=["All"],
-                    AttributeNames=["All"],
-                )
-            except (BotoCoreError, ClientError) as exc:
-                logger.error("Failed to poll SQS: %s", exc)
-                time.sleep(5)
+            messages = response.get("Messages", [])
+            if not messages:
                 continue
 
-            for msg in messages.get("Messages", []):
-                receipt = msg["ReceiptHandle"]
-                rc = int(msg.get("Attributes", {}).get("ApproximateReceiveCount", "1"))
-                logger.info(
-                    "SQS received (ReceiveCount=%s, MessageId=%s)",
-                    rc,
-                    msg.get("MessageId"),
-                )
+            for message in messages:
+                receipt_handle = message["ReceiptHandle"]
                 try:
-                    body = json.loads(msg.get("Body", "{}"))
-                except json.JSONDecodeError:
-                    logger.error("Invalid message body, deleting: %s", msg.get("Body"))
-                    self._delete_message(receipt)
-                    continue
+                    logging.info(f"Received message: {message['MessageId']}")
+                    job_details = json.loads(message["Body"])
+                    
+                    # 파이프라인 실행
+                    full_pipeline(job_details)
 
-                success = False
-                try:
-                    self._handle_job(body, receipt)
-                    success = True
-                except JobProcessingError as exc:
-                    logger.error("Job %s failed: %s", body.get("job_id"), exc)
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception("Unexpected error handling message: %s", exc)
-
-                finally:
-                    if success:
-                        self._delete_message(receipt)
-                        logger.info("SQS deleted: %s", msg.get("MessageId"))
-                    else:
-                        logger.warning(
-                            "Job %s failed; leaving message %s for retry",
-                            body.get("job_id"),
-                            msg.get("MessageId"),
-                        )
-
-    def _delete_message(self, receipt: str) -> None:
-        try:
-            self.sqs.delete_message(QueueUrl=self.queue_url, ReceiptHandle=receipt)
-        except (BotoCoreError, ClientError) as exc:
-            logger.error("Failed to delete SQS message: %s", exc)
-
-    def _maybe_extend_visibility(
-        self, receipt: Optional[str], duration_hint: Optional[float]
-    ) -> None:
-        if not receipt or not duration_hint or duration_hint <= 0:
-            return
-
-        target_timeout = int(
-            min(
-                self.visibility_max,
-                max(
-                    self.visibility_timeout,
-                    math.ceil(duration_hint * self.visibility_multiplier)
-                    + self.visibility_padding,
-                ),
-            )
-        )
-        if target_timeout <= self.visibility_timeout:
-            return
-
-        try:
-            self.sqs.change_message_visibility(
-                QueueUrl=self.queue_url,
-                ReceiptHandle=receipt,
-                VisibilityTimeout=target_timeout,
-            )
-            logger.info(
-                "Extended message visibility to %s seconds (duration hint %.2fs)",
-                target_timeout,
-                duration_hint,
-            )
-        except (BotoCoreError, ClientError) as exc:
-            logger.warning("Failed to extend message visibility: %s", exc)
-
-    def _handle_job(
-        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
-    ) -> None:
-        task = (payload.get("task") or "full_pipeline").lower()
-
-        if task == "full_pipeline":  # preTTS
-            self._handle_full_pipeline(payload, receipt_handle)
-        elif task == "segment_tts":
-            self._handle_segment_tts(payload, receipt_handle)
-        elif task in {"segment_mix", "tts_bgm_mix"}:
-            self._handle_segment_mix(payload, receipt_handle)
-            # 최종 TTS + mix -> 최종 결과물 나오는 ~ handle_최종 어쩌구 저쩌구(payload) 필요
-        else:
-            raise JobProcessingError(f"Unsupported task type: {task}")
-
-    def _upload_file(
-        self, local_path: str, key: str, content_type: Optional[str] = None
-    ) -> None:
-        extra: Dict[str, Any] | None = None
-        if content_type:
-            extra = {"ContentType": content_type}
-        kwargs: Dict[str, Any] = {}
-        if extra:
-            kwargs["ExtraArgs"] = extra
-        self.s3.upload_file(local_path, self.bucket, key, **kwargs)
-
-    def _prepare_segment_assets(
-        self,
-        project_id: str,
-        job_id: str,
-        meta: Dict[str, Any],
-    ) -> None:
-        segments = meta.get("segments") or []
-        if not segments:
-            return
-
-        workdir = meta.get("workdir") or _ensure_workdir(job_id)
-        segment_dir = os.path.join(workdir, "segments")
-        os.makedirs(segment_dir, exist_ok=True)
-
-        prefix = self.interim_segment_prefix.format(
-            project_id=project_id, job_id=job_id
-        ).rstrip("/")
-
-        speech_src = meta.get("speech_only_48k") or meta.get("audio_full_48k")
-        bgm_src = meta.get("bgm_48k")
-        tts_src = meta.get("dubbed_wav")
-        final_mix_src = meta.get("final_mix")
-        mix_src = final_mix_src or meta.get("dubbed_wav")
-        video_src = meta.get("input")
-
-        def _cut_if_possible(
-            src: Optional[str],
-            dst: str,
-            start: float,
-            end: float,
-            *,
-            sample_rate: Optional[int] = None,
-            channels: Optional[int] = None,
-        ) -> bool:
-            if not src or not os.path.exists(src):
-                return False
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{start:.6f}",
-                "-to",
-                f"{end:.6f}",
-                "-i",
-                shlex.quote(src),
-            ]
-            if sample_rate:
-                cmd.extend(["-ar", str(sample_rate)])
-            if channels:
-                cmd.extend(["-ac", str(channels)])
-            if sample_rate or channels:
-                cmd.extend(["-c:a", "pcm_s16le"])
-            else:
-                cmd.extend(["-c", "copy"])
-            cmd.append(shlex.quote(dst))
-            run(" ".join(cmd))
-            return True
-
-        for idx, seg in enumerate(segments):
-            try:
-                start = float(seg.get("start", 0.0))
-                end = float(seg.get("end", 0.0))
-            except (TypeError, ValueError):
-                continue
-            if end <= start + 1e-3:
-                continue
-
-            base_name = f"{idx:04d}"
-            assets: Dict[str, Any] = {}
-
-            # 원본 발화
-            local_source = os.path.join(segment_dir, f"{base_name}_source.wav")
-            has_source = _cut_if_possible(
-                speech_src, local_source, start, end, sample_rate=16000, channels=1
-            )
-            if has_source:
-                source_key = f"{prefix}/{base_name}_source.wav"
-                self._upload_file(local_source, source_key, "audio/wav")
-                assets["source_key"] = source_key
-
-            # BGM
-            local_bgm = os.path.join(segment_dir, f"{base_name}_bgm.wav")
-            has_bgm = _cut_if_possible(
-                bgm_src, local_bgm, start, end, sample_rate=48000, channels=2
-            )
-            if has_bgm:
-                bgm_key = f"{prefix}/{base_name}_bgm.wav"
-                self._upload_file(local_bgm, bgm_key, "audio/wav")
-                assets["bgm_key"] = bgm_key
-
-            # 합성 음성
-            local_tts = os.path.join(segment_dir, f"{base_name}_tts.wav")
-            has_tts = _cut_if_possible(
-                tts_src, local_tts, start, end, sample_rate=48000, channels=1
-            )
-            if has_tts:
-                tts_key = f"{prefix}/{base_name}_tts.wav"
-                self._upload_file(local_tts, tts_key, "audio/wav")
-                assets["tts_key"] = tts_key
-
-            # 배경음이 섞인 최종 믹스(없으면 TTS로 폴백)
-            local_mix = os.path.join(segment_dir, f"{base_name}_mix.wav")
-            mix_created = False
-            if final_mix_src and _cut_if_possible(
-                final_mix_src, local_mix, start, end, sample_rate=48000, channels=2
-            ):
-                mix_created = True
-            elif (
-                has_bgm
-                and has_tts
-                and os.path.exists(local_bgm)
-                and os.path.exists(local_tts)
-            ):
-                try:
-                    mix_bgm_with_tts(local_bgm, local_tts, local_mix)
-                    mix_created = True
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(
-                        "Failed to create bgm mix for segment %s: %s", base_name, exc
+                    # 처리 완료 후 메시지 삭제
+                    sqs_client.delete_message(
+                        QueueUrl=JOB_QUEUE_URL,
+                        ReceiptHandle=receipt_handle
                     )
-            elif mix_src and _cut_if_possible(
-                mix_src, local_mix, start, end, sample_rate=48000, channels=2
-            ):
-                mix_created = True
+                    logging.info(f"Deleted message: {message['MessageId']}")
 
-            if mix_created and os.path.exists(local_mix):
-                mix_key = f"{prefix}/{base_name}_mix.wav"
-                self._upload_file(local_mix, mix_key, "audio/wav")
-                assets["mix_key"] = mix_key
+                except json.JSONDecodeError as e:
+                    logging.error(f"Invalid JSON in message body: {e}")
+                    # 잘못된 형식의 메시지는 큐에서 삭제
+                    sqs_client.delete_message(QueueUrl=JOB_QUEUE_URL, ReceiptHandle=receipt_handle)
+                except Exception as e:
+                    logging.error(f"Error processing message {message.get('MessageId', 'N/A')}: {e}")
+                    # 처리 중 에러 발생 시, 메시지를 바로 삭제하지 않고 SQS의 Visibility Timeout에 따라 재처리되도록 둡니다.
+                    # 또는 Dead Letter Queue로 보내는 정책을 사용할 수 있습니다.
+                    # 여기서는 일단 로깅만 하고 넘어갑니다.
+                    pass
 
-            # 구간 영상 (원본 오디오 포함)
-            if video_src and os.path.exists(video_src):
-                local_video = os.path.join(segment_dir, f"{base_name}_video.mp4")
-                duration = max(0.05, end - start)
-                run(
-                    " ".join(
-                        [
-                            "ffmpeg -y",
-                            f"-ss {start:.6f}",
-                            f"-i {shlex.quote(video_src)}",
-                            f"-t {duration:.6f}",
-                            "-map 0:v:0",
-                            "-map 0:a:0?",
-                            "-c:v copy",
-                            "-c:a copy",
-                            "-movflags +faststart",
-                            shlex.quote(local_video),
-                        ]
-                    )
-                )
-                video_key = f"{prefix}/{base_name}_video.mp4"
-                self._upload_file(local_video, video_key, "video/mp4")
-                assets["video_key"] = video_key
-
-            if assets:
-                seg.setdefault("assets", {}).update(assets)
-                for key, value in assets.items():
-                    seg[key] = value
-
-        save_meta(workdir, meta)
-
-    def _handle_full_pipeline(
-        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
-    ) -> None:
-        job_id = payload.get("job_id")
-        project_id = payload.get("project_id")
-        input_key = payload.get("input_key")
-        callback_url = payload.get("callback_url")
-        if not all([job_id, project_id, input_key, callback_url]):
-            raise JobProcessingError("Missing required job fields in payload")
-        target_lang = payload.get("target_lang") or self.default_target_lang
-        source_lang = payload.get("source_lang") or self.default_source_lang
-        workdir = _ensure_workdir(job_id)
-        extension = os.path.splitext(input_key)[1]
-        local_input = os.path.join(workdir, f"input{extension or '.mp4'}")
-        try:
-            logger.info(
-                "Downloading s3://%s/%s to %s", self.bucket, input_key, local_input
-            )
-            self.s3.download_file(self.bucket, input_key, local_input)
-            duration_hint: Optional[float] = None
-            try:
-                duration_hint = ffprobe_duration(local_input)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning("Failed to probe duration for %s: %s", local_input, exc)
-            else:
-                self._maybe_extend_visibility(receipt_handle, duration_hint)
-            self._post_status(
-                callback_url,
-                "in_progress",
-                stage_id="asr",
-                stage_status="processing",
-                project_id=project_id,
-                metadata={
-                    "stage": "downloaded",
-                    "job_id": job_id,
-                    "project_id": project_id,
-                },
-            )
-
-            meta = _run_asr_stage(job_id, local_input)
-            self._post_status(
-                callback_url, "in_progress", metadata={"stage": "stt_completed"}
-            )
-            self._post_status(
-                callback_url, "in_progress", metadata={"stage": "mt_prepare"}
-            )
-            translations = translate_stage(
-                meta["segments"], src=source_lang, tgt=target_lang
-            )
-            meta["translations"] = translations
-            save_meta(workdir, meta)
-            self._post_status(
-                callback_url, "in_progress", metadata={"stage": "mt_completed"}
-            )
-            self._post_status(
-                callback_url,
-                "in_progress",
-                stage_id="tts",
-                stage_status="processing",
-                project_id=project_id,
-                metadata={
-                    "stage": "tts_prepare",
-                    "job_id": job_id,
-                    "project_id": project_id,
-                },
-            )
-
-            asyncio.run(tts_finalize_stage(job_id, target_lang, None))
-            output_path = mux_stage(job_id)
-            meta = load_meta(workdir)
-            self._prepare_segment_assets(project_id, job_id, meta)
-            meta = load_meta(workdir)
-            segments_payload = _build_segment_payload(meta, translations)
-            result_key = self.result_video_prefix.format(
-                project_id=project_id, job_id=job_id
-            )
-            metadata_key = self.result_meta_prefix.format(
-                project_id=project_id, job_id=job_id
-            )
-            logger.info("Uploading result video to s3://%s/%s", self.bucket, result_key)
-            self.s3.upload_file(output_path, self.bucket, result_key)
-            self.s3.put_object(
-                Bucket=self.bucket,
-                Key=metadata_key,
-                Body=json.dumps(
-                    {
-                        "job_id": job_id,
-                        "project_id": project_id,
-                        "segments": segments_payload,
-                        "target_lang": target_lang,
-                        "source_lang": source_lang,
-                        "input_key": input_key,
-                        "result_key": result_key,
-                    },
-                    ensure_ascii=False,
-                ).encode("utf-8"),
-                ContentType="application/json",
-            )
-            status_payload = {
-                "stage": "tts_completed",
-                "segments_count": len(segments_payload),
-                "segments": segments_payload,
-                "metadata_key": metadata_key,
-                "result_key": result_key,
-                "target_lang": target_lang,
-                "source_lang": source_lang,
-                "input_key": input_key,
-                "segment_assets_prefix": self.interim_segment_prefix.format(
-                    project_id=project_id, job_id=job_id
-                ),
-            }
-            self._post_status(
-                callback_url,
-                "done",
-                stage_id="mux",
-                stage_status="done",
-                project_id=project_id,
-                result_key=result_key,
-                metadata=status_payload,
-            )
-        except (BotoCoreError, ClientError) as exc:
-            failure = JobProcessingError(f"AWS client error: {exc}")
-            self._safe_fail(callback_url, failure)
-            raise failure
-        except JobProcessingError as exc:
-            self._safe_fail(callback_url, exc)
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            wrapped = JobProcessingError(str(exc))
-            self._safe_fail(callback_url, wrapped)
-            raise wrapped
-
-    def _handle_segment_tts(
-        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
-    ) -> None:
-        job_id = payload.get("job_id")
-        callback_url = payload.get("callback_url")
-        segment_payload: Dict[str, Any] = payload.get("segment") or {}
-
-        if not job_id or not callback_url:
-            raise JobProcessingError("segment_tts requires job_id and callback_url")
-
-        try:
-            segment_index = int(segment_payload.get("segment_index"))
-        except (TypeError, ValueError):
-            raise JobProcessingError("segment_tts requires a numeric segment_index")
-
-        text = segment_payload.get("text")
-        if not text:
-            raise JobProcessingError("segment_tts requires translated text")
-
-        project_id = segment_payload.get("project_id") or payload.get("project_id")
-        segment_id = segment_payload.get("segment_id")
-        assets: Dict[str, Any] = segment_payload.get("assets") or {}
-        source_keys: List[str] = [
-            str(k) for k in segment_payload.get("source_keys") or [] if k
-        ]
-        assets_prefix = segment_payload.get("segment_assets_prefix") or payload.get(
-            "segment_assets_prefix"
-        )
-
-        base_name = f"{segment_index:04d}"
-        if not source_keys and assets.get("source_key"):
-            source_keys.append(str(assets["source_key"]))
-        if not source_keys and assets_prefix:
-            source_keys.append(f"{assets_prefix.rstrip('/')}/{base_name}_source.wav")
-
-        fallback_ref_key = assets.get("tts_key")
-        workdir = os.path.join(_ensure_workdir(job_id), "segment_tts")
-        os.makedirs(workdir, exist_ok=True)
-
-        try:
-            self._post_status(
-                callback_url,
-                "in_progress",
-                stage_id="segment_tts",
-                stage_status="processing",
-                project_id=project_id,
-                metadata={
-                    "stage": "segment_tts_started",
-                    "job_id": job_id,
-                    "project_id": project_id,
-                    "segment_index": segment_index,
-                },
-            )
-
-            local_refs: List[str] = []
-            for idx, key in enumerate(source_keys):
-                local_path = os.path.join(workdir, f"ref_{idx:02d}.wav")
-                try:
-                    self.s3.download_file(self.bucket, key, local_path)
-                    local_refs.append(local_path)
-                except (BotoCoreError, ClientError) as exc:
-                    logger.warning("Failed to download source key %s: %s", key, exc)
-
-            if not local_refs and fallback_ref_key:
-                local_fallback = os.path.join(workdir, "ref_fallback.wav")
-                try:
-                    self.s3.download_file(self.bucket, fallback_ref_key, local_fallback)
-                    local_refs.append(local_fallback)
-                except (BotoCoreError, ClientError) as exc:
-                    logger.warning(
-                        "Failed to download fallback TTS key %s: %s",
-                        fallback_ref_key,
-                        exc,
-                    )
-
-            if not local_refs:
-                raise JobProcessingError("No reference audio available for segment_tts")
-
-            converted_refs: List[str] = []
-            for path in local_refs:
-                base = os.path.splitext(os.path.basename(path))[0]
-                converted = os.path.join(workdir, f"{base}_24k.wav")
-                run(
-                    f"ffmpeg -y -i {shlex.quote(path)} -ar 24000 -ac 1 {shlex.quote(converted)}"
-                )
-                converted_refs.append(converted)
-
-            if len(converted_refs) == 1:
-                ref_candidate = converted_refs[0]
-            else:
-                ref_candidate = os.path.join(workdir, "ref_concat.wav")
-                concat_audio(converted_refs, ref_candidate)
-
-            ref_path = os.path.join(workdir, "ref.wav")
-            ref_duration = ffprobe_duration(ref_candidate)
-            target_ref_duration = 6.0 if ref_duration < 6.0 else ref_duration
-            trim_or_pad_to_duration(
-                ref_candidate, ref_path, target_ref_duration, ar=24000
-            )
-
-            target_lang = (
-                segment_payload.get("target_lang")
-                or payload.get("target_lang")
-                or self.default_target_lang
-            )
-
-            raw_tts_path = os.path.join(workdir, "tts_raw.wav")
-            try:
-                synthesize(
-                    text,
-                    ref_path,
-                    language=target_lang,
-                    out_path=raw_tts_path,
-                    model_name=TTS_MODEL,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                raise JobProcessingError(f"TTS synthesis failed: {exc}") from exc
-
-            start_point = float(segment_payload.get("start_point", 0.0) or 0.0)
-            end_point = float(segment_payload.get("end_point", 0.0) or 0.0)
-            slot = (
-                max(0.05, end_point - start_point) if end_point > start_point else None
-            )
-            sub_length = segment_payload.get("sub_length")
-            if sub_length is not None:
-                try:
-                    sub_length = float(sub_length)
-                except (TypeError, ValueError):
-                    sub_length = None
-
-            target_duration = sub_length if sub_length and sub_length > 0 else slot
-
-            final_tts_path = raw_tts_path
-            if target_duration and target_duration > 0:
-                fitted_path = os.path.join(workdir, "tts_fitted.wav")
-                trim_or_pad_to_duration(
-                    raw_tts_path, fitted_path, target_duration, ar=24000
-                )
-                final_tts_path = fitted_path
-
-            # Align TTS loudness to original 화자 평균 볼륨
-            ref_db = detect_mean_volume_db(ref_path)
-            tts_db = detect_mean_volume_db(final_tts_path)
-            gain_db_applied: Optional[float] = None
-            if ref_db is not None and tts_db is not None:
-                gain_db = ref_db - tts_db
-                if abs(gain_db) >= 0.5:
-                    gain_db = max(min(gain_db, 18.0), -12.0)
-                    boosted_path = os.path.join(workdir, "tts_gain.wav")
-                    apply_gain_db(final_tts_path, boosted_path, gain_db, ar=24000, ac=1)
-                    os.replace(boosted_path, final_tts_path)
-                    gain_db_applied = gain_db
-
-            # 48k 변환 (mix 단계와 동일한 샘플레이트 사용)
-            tts_48k_path = os.path.join(workdir, "tts_48k.wav")
-            run(
-                f"ffmpeg -y -i {shlex.quote(final_tts_path)} -ar 48000 -ac 1 {shlex.quote(tts_48k_path)}"
-            )
-
-            tts_key = assets.get("tts_key")
-            if not tts_key and assets_prefix:
-                tts_key = f"{assets_prefix.rstrip('/')}/{base_name}_tts.wav"
-            if not tts_key:
-                raise JobProcessingError("Unable to determine TTS upload key")
-
-            self._upload_file(tts_48k_path, tts_key, "audio/wav")
-
-            mix_key = assets.get("mix_key")
-            bgm_key = assets.get("bgm_key")
-            uploaded_mix_key = None
-
-            if bgm_key:
-                local_bgm = os.path.join(workdir, "bgm.wav")
-                self.s3.download_file(self.bucket, bgm_key, local_bgm)
-
-                aligned_bgm = local_bgm
-                if target_duration and target_duration > 0:
-                    bgm_duration = ffprobe_duration(local_bgm)
-                    aligned_bgm = os.path.join(workdir, "bgm_aligned.wav")
-                    if abs(bgm_duration - target_duration) <= 0.01:
-                        shutil.copyfile(local_bgm, aligned_bgm)
-                    elif bgm_duration > target_duration + 0.01:
-                        run(
-                            " ".join(
-                                [
-                                    "ffmpeg -y",
-                                    f"-i {shlex.quote(local_bgm)}",
-                                    f'-af "atrim=0:{target_duration:.6f},asetpts=PTS-STARTPTS"',
-                                    "-ar 48000",
-                                    "-ac 2",
-                                    shlex.quote(aligned_bgm),
-                                ]
-                            )
-                        )
-                    else:
-                        pad = max(0.0, target_duration - bgm_duration)
-                        run(
-                            " ".join(
-                                [
-                                    "ffmpeg -y",
-                                    f"-i {shlex.quote(local_bgm)}",
-                                    f'-filter_complex "apad=pad_dur={pad:.6f},atrim=0:{target_duration:.6f},asetpts=PTS-STARTPTS"',
-                                    "-ar 48000",
-                                    "-ac 2",
-                                    shlex.quote(aligned_bgm),
-                                ]
-                            )
-                        )
-
-                bgm_gain = (
-                    segment_payload.get("bgm_gain") or assets.get("bgm_gain") or 1.4
-                )
-                tts_mix_gain = (
-                    segment_payload.get("tts_gain") or assets.get("tts_gain") or 1.0
-                )
-                try:
-                    bgm_gain = float(bgm_gain)
-                except (TypeError, ValueError):
-                    bgm_gain = 1.0
-                try:
-                    tts_mix_gain = float(tts_mix_gain)
-                except (TypeError, ValueError):
-                    tts_mix_gain = 1.0
-
-                local_mix = os.path.join(workdir, "mix.wav")
-                mix_filter = (
-                    f"[0:a]volume={bgm_gain:.4f}[bgm];"
-                    f"[1:a]volume={tts_mix_gain:.4f}[tts];"
-                    "[bgm][tts]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[m];"
-                    "[m]alimiter=limit=0.95,asetpts=PTS-STARTPTS"
-                )
-                run(
-                    " ".join(
-                        [
-                            "ffmpeg -y",
-                            f"-i {shlex.quote(aligned_bgm)}",
-                            f"-i {shlex.quote(tts_48k_path)}",
-                            f'-filter_complex "{mix_filter}"',
-                            "-ar 48000",
-                            "-ac 2",
-                            shlex.quote(local_mix),
-                        ]
-                    )
-                )
-
-                upload_key = mix_key or (
-                    f"{assets_prefix.rstrip('/')}/{base_name}_mix.wav"
-                    if assets_prefix
-                    else None
-                )
-                if upload_key:
-                    self._upload_file(local_mix, upload_key, "audio/wav")
-                    uploaded_mix_key = upload_key
-            else:
-                raise JobProcessingError(
-                    "segment_tts requires bgm_key to generate mixed audio"
-                )
-
-            metadata: Dict[str, Any] = {
-                "stage": "segment_tts_completed",
-                "segment": {
-                    "segment_index": segment_index,
-                    "segment_id": segment_id,
-                    "translate_context": text,
-                    "tts_key": tts_key,
-                },
-            }
-            if uploaded_mix_key:
-                metadata["segment"]["mix_key"] = uploaded_mix_key
-            if gain_db_applied is not None:
-                metadata["segment"]["tts_gain_db"] = gain_db_applied
-            if assets_prefix:
-                metadata["segment_assets_prefix"] = assets_prefix
-            if project_id:
-                metadata["project_id"] = project_id
-
-            self._post_status(
-                callback_url,
-                "done",
-                stage_id="segment_tts",
-                stage_status="done",
-                project_id=project_id,
-                metadata=metadata,
-            )
-
-        except (BotoCoreError, ClientError) as exc:
-            failure = JobProcessingError(f"AWS client error: {exc}")
-            self._safe_fail(callback_url, failure)
-            raise failure
-        except JobProcessingError as exc:
-            self._safe_fail(callback_url, exc)
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            wrapped = JobProcessingError(str(exc))
-            self._safe_fail(callback_url, wrapped)
-            raise wrapped
-
-    def _handle_segment_mix(
-        self, payload: Dict[str, Any], receipt_handle: Optional[str] = None
-    ) -> None:
-        job_id = payload.get("job_id")
-        callback_url = payload.get("callback_url")
-        if not job_id or not callback_url:
-            raise JobProcessingError("segment_mix requires job_id and callback_url")
-        segments: List[Dict[str, Any]] = payload.get("segments") or []
-        if not segments:
-            raise JobProcessingError("segment_mix requires at least one segment entry")
-        intermediate_prefix = payload.get("intermediate_prefix")
-        output_prefix = payload.get("output_prefix") or intermediate_prefix
-        project_id = payload.get("project_id")
-        workdir = os.path.join(_ensure_workdir(job_id), "segment_mix")
-        os.makedirs(workdir, exist_ok=True)
-        try:
-            self._post_status(
-                callback_url,
-                "in_progress",
-                stage_id="segment_mix",
-                stage_status="processing",
-                project_id=project_id,
-                metadata={
-                    "stage": "segment_mix_started",
-                    "job_id": job_id,
-                    "project_id": project_id,
-                    "count": len(segments),
-                },
-            )
-
-            mix_results: List[Dict[str, Any]] = []
-            for segment in segments:
-                index = segment.get("index")
-                if index is None:
-                    raise JobProcessingError("segment entry missing index")
-
-                assets = segment.get("assets") or {}
-                bgm_key = segment.get("bgm_key") or assets.get("bgm_key")
-                tts_key = segment.get("tts_key") or assets.get("tts_key")
-                if not bgm_key or not tts_key:
-                    if not intermediate_prefix:
-                        raise JobProcessingError(
-                            "segment entry missing S3 keys and no intermediate_prefix provided"
-                        )
-                    prefix = intermediate_prefix.rstrip("/")
-                    bgm_key = bgm_key or f"{prefix}/{index}_bgm.wav"
-                    tts_key = tts_key or f"{prefix}/{index}_tts.wav"
-
-                target_prefix = output_prefix or intermediate_prefix
-                if not target_prefix:
-                    target_prefix = os.path.dirname(bgm_key)
-                target_prefix = target_prefix.rstrip("/")
-                output_key = (
-                    segment.get("output_key")
-                    or assets.get("mix_key")
-                    or f"{target_prefix}/{index}_mix.wav"
-                )
-
-                local_bgm = os.path.join(workdir, f"{index}_bgm.wav")
-                local_tts = os.path.join(workdir, f"{index}_tts.wav")
-
-                mixed_path = os.path.join(workdir, f"{index}_mix.wav")
-
-                logger.info(
-                    "Processing segment %s for job %s (bgm=%s, tts=%s -> %s)",
-                    index,
-                    job_id,
-                    bgm_key,
-                    tts_key,
-                    output_key,
-                )
-
-                self.s3.download_file(self.bucket, bgm_key, local_bgm)
-                self.s3.download_file(self.bucket, tts_key, local_tts)
-
-                bgm_gain = float(segment.get("bgm_gain", 1.0))
-                tts_gain = float(segment.get("tts_gain", 1.0))
-
-                ffmpeg_cmd = (
-                    "ffmpeg -y "
-                    f"-i {shlex.quote(local_tts)} "
-                    f"-i {shlex.quote(local_bgm)} "
-                    "-filter_complex "
-                    f'"[0:a]volume={tts_gain}[v0];[1:a]volume={bgm_gain}[v1];[v0][v1]amix=inputs=2:duration=longest" '
-                    f"-c:a pcm_s16le {shlex.quote(mixed_path)}"
-                )
-                run(ffmpeg_cmd)
-
-                self.s3.upload_file(mixed_path, self.bucket, output_key)
-
-                mix_results.append(
-                    {
-                        "index": index,
-                        "bgm_key": bgm_key,
-                        "tts_key": tts_key,
-                        "output_key": output_key,
-                        "bgm_gain": bgm_gain,
-                        "tts_gain": tts_gain,
-                    }
-                )
-
-            self._post_status(
-                callback_url,
-                "done",
-                stage_id="segment_mix",
-                stage_status="done",
-                project_id=project_id,
-                metadata={
-                    "stage": "segment_mix_completed",
-                    "job_id": job_id,
-                    "project_id": project_id,
-                    "segments": mix_results,
-                },
-            )
-        except (BotoCoreError, ClientError) as exc:
-            failure = JobProcessingError(f"AWS client error: {exc}")
-            self._safe_fail(callback_url, failure)
-            raise failure
-        except JobProcessingError as exc:
-            self._safe_fail(callback_url, exc)
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            wrapped = JobProcessingError(str(exc))
-            self._safe_fail(callback_url, wrapped)
-            raise wrapped
-
-    def _safe_fail(
-        self,
-        callback_url: str,
-        error: JobProcessingError,
-        *,
-        stage_id: str = "pipeline",
-    ) -> None:
-        try:
-            self._post_status(
-                callback_url,
-                "failed",
-                stage_id=stage_id,
-                stage_status="failed",
-                error=str(error),
-                metadata={"stage": "failed"},
-            )
-        except JobProcessingError as callback_exc:
-            logger.error("Failed to deliver failure callback: %s", callback_exc)
-
-    def _post_status(
-        self,
-        callback_url: str,
-        status: str,
-        *,
-        result_key: Optional[str] = None,
-        error: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        stage_id: Optional[str] = None,
-        stage_status: Optional[str] = None,
-        project_id: Optional[str] = None,
-    ) -> None:
-        stage_id = stage_id or "pipeline"
-        stage_status = stage_status or ("done" if status == "done" else "processing")
-
-        payload: Dict[str, Any] = {
-            "status": status,
-            "stage_id": stage_id,
-            "stage_status": stage_status,
-        }
-        if project_id is not None:
-            payload["project_id"] = project_id
-        if result_key is not None:
-            payload["result_key"] = result_key
-        if error is not None:
-            payload["error"] = error
-        if metadata is not None:
-            payload["metadata"] = metadata
-
-        target_url = self._normalize_callback_url(callback_url)
-
-        try:
-            resp = self.http.post(target_url, json=payload, timeout=30)
-        except requests.RequestException as exc:
-            raise JobProcessingError(f"Callback request failed: {exc}") from exc
-
-        if not resp.ok:
-            raise JobProcessingError(
-                f"Callback responded with {resp.status_code}: {resp.text[:200]}"
-            )
-
-    def _normalize_callback_url(self, callback_url: str) -> str:
-        """
-        Replace localhost callback hosts with a reachable hostname when running inside containers.
-        """
-        parsed = urlparse(callback_url)
-        if (
-            parsed.hostname in {"localhost", "127.0.0.1"}
-            and self.callback_localhost_host
-        ):
-            host = self.callback_localhost_host
-            netloc = host
-            if parsed.port:
-                netloc = f"{host}:{parsed.port}"
-            parsed = parsed._replace(netloc=netloc)
-        return urlunparse(parsed)
-
-
-def run_worker() -> None:
-    worker = QueueWorker()
-    worker.poll_forever()
+        except (BotoCoreError, ClientError) as e:
+            logging.error(f"Error polling SQS: {e}")
+            await asyncio.sleep(10) # 에러 발생 시 잠시 대기 후 재시도
+        except Exception as e:
+            logging.error(f"An unexpected error occurred in the poller: {e}")
+            await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
-    run_worker()
+    asyncio.run(poll_sqs())
