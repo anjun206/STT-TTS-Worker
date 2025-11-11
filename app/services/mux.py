@@ -2,7 +2,7 @@
 import os
 import subprocess
 from pydub import AudioSegment
-from config import get_job_paths
+from configs import get_job_paths
 from pathlib import Path
 
 

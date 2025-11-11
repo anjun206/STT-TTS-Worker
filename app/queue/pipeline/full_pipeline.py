@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.config import (
+from app.configs.env import (
     AWS_S3_BUCKET,
     DEFAULT_SOURCE_LANG,
     DEFAULT_TARGET_LANG,
