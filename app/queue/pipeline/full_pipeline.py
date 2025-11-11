@@ -58,12 +58,8 @@ class FullPipeline:
         self.project_id = payload.get("project_id")
         self.input_key = (payload.get("input_key") or "").strip()
         self.callback_url = (payload.get("callback_url") or "").strip()
-        self.target_lang = (
-            payload.get("target_lang") or DEFAULT_TARGET_LANG
-        ).strip()
-        self.source_lang = (
-            payload.get("source_lang") or DEFAULT_SOURCE_LANG
-        ).strip()
+        self.target_lang = (payload.get("target_lang") or DEFAULT_TARGET_LANG).strip()
+        self.source_lang = (payload.get("source_lang") or DEFAULT_SOURCE_LANG).strip()
         self.voice_sample_key = payload.get("voice_sample_key")
         self.voice_sample_bucket = payload.get("voice_sample_bucket") or self.bucket
         self.voice_sample_path_hint = payload.get("voice_sample_path")
@@ -71,8 +67,14 @@ class FullPipeline:
         self.prompt_text = raw_prompt.strip() if isinstance(raw_prompt, str) else None
 
         self.output_prefix = self._resolve_output_prefix(payload.get("output_prefix"))
-        self.result_key = payload.get("result_key") or f"{self.output_prefix}/videos/{self.job_id}.mp4"
-        self.metadata_key = payload.get("metadata_key") or f"{self.output_prefix}/metadata/{self.job_id}.json"
+        self.result_key = (
+            payload.get("result_key")
+            or f"{self.output_prefix}/videos/{self.job_id}.mp4"
+        )
+        self.metadata_key = (
+            payload.get("metadata_key")
+            or f"{self.output_prefix}/metadata/{self.job_id}.json"
+        )
 
         self.paths = ensure_job_dirs(self.job_id) if self.job_id else None
         self.local_input = None
@@ -93,10 +95,9 @@ class FullPipeline:
             run_asr(self.job_id)
             self._post_stage("stt_completed")
 
+            self._post_stage("mt_prepare")
             translations = translate_transcript(self.job_id, self.target_lang)
-            self._post_stage(
-                "translation_completed", {"segments_translated": len(translations)}
-            )
+            self._post_stage("mt_completed", {"segments_translated": len(translations)})
 
             voice_sample_path = self._prepare_voice_sample()
             segments_payload = generate_tts(
@@ -112,11 +113,16 @@ class FullPipeline:
             except FileNotFoundError as exc:
                 logger.info("싱크 입력이 없어 건너뜁니다: %s", exc)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.warning("싱크 단계가 실패했습니다. 기존 세그먼트를 그대로 사용합니다: %s", exc)
+                logger.warning(
+                    "싱크 단계가 실패했습니다. 기존 세그먼트를 그대로 사용합니다: %s",
+                    exc,
+                )
             else:
                 if synced_segments:
                     segments_payload = synced_segments
-                    self._post_stage("sync_completed", {"segments": len(segments_payload)})
+                    self._post_stage(
+                        "sync_completed", {"segments": len(segments_payload)}
+                    )
 
             # 3) 믹싱 및 결과 업로드
             mux_outputs = mux_audio_video(self.job_id)
@@ -152,7 +158,9 @@ class FullPipeline:
         except JobProcessingError:
             raise
         except (BotoCoreError, ClientError) as exc:
-            raise JobProcessingError(f"AWS 클라이언트 오류가 발생했습니다: {exc}") from exc
+            raise JobProcessingError(
+                f"AWS 클라이언트 오류가 발생했습니다: {exc}"
+            ) from exc
         except Exception as exc:  # pylint: disable=broad-except
             raise JobProcessingError(str(exc)) from exc
 
@@ -175,10 +183,22 @@ class FullPipeline:
             return f"projects/{self.project_id}/{self.job_id}"
         return f"jobs/{self.job_id}"
 
-    def _post_stage(self, stage: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def _post_stage(
+        self, stage: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not self.callback_url:
             return
         payload = {"stage": stage, "job_id": self.job_id}
+        if self.project_id:
+            payload["project_id"] = self.project_id
+        if self.target_lang:
+            payload["target_lang"] = self.target_lang
+        if self.source_lang:
+            payload["source_lang"] = self.source_lang
+        if self.result_key:
+            payload["result_key"] = self.result_key
+        if self.metadata_key:
+            payload["metadata_key"] = self.metadata_key
         if metadata:
             payload.update(metadata)
         post_status(
@@ -228,7 +248,9 @@ class FullPipeline:
                 self.voice_sample_bucket, self.voice_sample_key, str(dest)
             )
         except (BotoCoreError, ClientError) as exc:
-            raise JobProcessingError(f"보이스 샘플 다운로드에 실패했습니다: {exc}") from exc
+            raise JobProcessingError(
+                f"보이스 샘플 다운로드에 실패했습니다: {exc}"
+            ) from exc
         return dest
 
     def _upload_file(self, path: Path, bucket: str, key: str) -> None:
@@ -248,7 +270,9 @@ class FullPipeline:
                 ContentType="application/json",
             )
         except (BotoCoreError, ClientError) as exc:
-            raise JobProcessingError(f"메타데이터 업로드에 실패했습니다: {exc}") from exc
+            raise JobProcessingError(
+                f"메타데이터 업로드에 실패했습니다: {exc}"
+            ) from exc
 
     def _build_metadata(
         self,
