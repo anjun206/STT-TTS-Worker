@@ -31,7 +31,7 @@ hooks:
       runas: ubuntu
 
     - location: deploy/install_dependencies.sh
-      timeout: 300
+      timeout: 1500
       runas: ubuntu
 
   ApplicationStart:

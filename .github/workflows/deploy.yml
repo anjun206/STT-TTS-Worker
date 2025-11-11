@@ -1,8 +1,16 @@
+<<<<<<< HEAD
+name: Deploy Worker
+
+on:
+  workflow_run:
+    workflows: ["CI"] # 이전 워크플로 이름
+=======
 name: deploy fastAPI
 
 on:
   workflow_run:
     workflows: ["Python application"] # 이전 워크플로 이름
+>>>>>>> main
     types:
       - completed
     branches:
@@ -42,7 +50,11 @@ jobs:
       # 5. zip 파일을 S3 버킷에 업로드
       - name: Upload package to S3
         run: |
+<<<<<<< HEAD
+          aws s3 cp app.zip s3://${{ secrets.S3_BUCKET }}/fastapi-app/app.zip
+=======
           aws s3 cp app.zip s3://${{ secrets.S3_BUCKET }}/worker-app/app.zip
+>>>>>>> main
 
       # 6. AWS CodeDeploy 배포 생성 (핵심)
       - name: Create CodeDeploy Deployment
@@ -50,6 +62,10 @@ jobs:
           aws deploy create-deployment \
             --application-name ${{ secrets.CODEDEPLOY_APP_NAME }} \
             --deployment-group-name ${{ secrets.CODEDEPLOY_DEPLOYMENT_GROUP_NAME }} \
+<<<<<<< HEAD
+            --s3-location bucket=${{ secrets.S3_BUCKET }},key=fastapi-app/app.zip,bundleType=zip \
+=======
             --s3-location bucket=${{ secrets.S3_BUCKET }},key=worker-app/app.zip,bundleType=zip \
+>>>>>>> main
             --description "Deployment from GitHub Actions" \
             --ignore-application-stop-failures # (선택) 첫 배포 시 중지할 서버가 없어도 무시
