@@ -14,7 +14,7 @@ import torchaudio
 from pydub import AudioSegment
 
 from app.configs.config import get_job_paths
-from services.transcript_store import (
+from app.services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
     segment_views,

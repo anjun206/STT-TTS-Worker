@@ -10,11 +10,11 @@ import requests
 from botocore.exceptions import ClientError, BotoCoreError
 
 # 워커의 서비스 모듈들
-from services.stt import run_asr
-from services.translate import translate_transcript
-from services.tts import generate_tts
-from services.sync import sync_segments
-from services.mux import mux_audio_video
+from app.services.stt import run_asr
+from app.services.translate import translate_transcript
+from app.services.tts import generate_tts
+from app.services.sync import sync_segments
+from app.services.mux import mux_audio_video
 from app.configs.config import ensure_job_dirs
 
 # 로깅 설정
@@ -119,7 +119,7 @@ def full_pipeline(job_details: dict):
         send_callback(callback_url, "in_progress", "Starting ASR...", stage="asr_started")
         run_asr(job_id, source_video_path)
         # ASR 결과물(compact transcript)을 S3에 업로드
-        from services.transcript_store import COMPACT_ARCHIVE_NAME
+        from app.services.transcript_store import COMPACT_ARCHIVE_NAME
         asr_result_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
         upload_to_s3(AWS_S3_BUCKET, f"projects/{project_id}/interim/{job_id}/{COMPACT_ARCHIVE_NAME}", asr_result_path)
         send_callback(callback_url, "in_progress", "ASR completed.", stage="asr_completed")

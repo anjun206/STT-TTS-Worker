@@ -32,13 +32,13 @@ try:
 except ImportError:  # WhisperX<3.7 fallback
     from whisperx import DiarizationPipeline
 from app.configs.config import WHISPERX_CACHE_DIR, ensure_job_dirs
-from services.transcript_store import (
+from app.services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     build_compact_transcript,
     save_compact_transcript,
     segment_preview,
 )
-from services.demucs_split import split_vocals
+from app.services.demucs_split import split_vocals
 
 logger = logging.getLogger(__name__)
 
