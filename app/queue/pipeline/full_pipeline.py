@@ -1,8 +1,8 @@
 from typing import Any, Dict
-from app.config.utils import JobProcessingError
+from app.configs.utils import JobProcessingError
 import os, logging
-from app.config.env import DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, LOG_LEVEL
-from app.config.utils import post_status, ensure_workdir
+from app.configs.env import DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, LOG_LEVEL
+from app.configs.utils import post_status, ensure_workdir
 from app.services.stt import run_asr
 from app.services.translate import translate_transcript
 from app.services.tts import generate_tts

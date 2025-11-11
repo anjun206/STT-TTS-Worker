@@ -1,8 +1,8 @@
 import os
-from app.config.env import JOB_QUEUE_URL, AWS_REGION, AWS_S3_BUCKET, DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, VISIBILITY_TIMEOUT, POLL_WAIT, CALLBACK_LOCALHOST_HOST, PROFILE, LOG_LEVEL
+from app.configs.env import JOB_QUEUE_URL, AWS_REGION, AWS_S3_BUCKET, DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, VISIBILITY_TIMEOUT, POLL_WAIT, CALLBACK_LOCALHOST_HOST, PROFILE, LOG_LEVEL
 from botocore.exceptions import BotoCoreError, ClientError
 import logging, time, requests, boto3, json
-from app.config.utils import JobProcessingError
+from app.configs.utils import JobProcessingError
 from typing import Any, Dict, Optional
 from .pipeline.full_pipeline import FullPipeline
 from pathlib import Path
