@@ -7,6 +7,7 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
+from app.configs.utils import JobProcessingError
 from app.configs.env import (
     JOB_QUEUE_URL,
     AWS_REGION,
@@ -15,7 +16,6 @@ from app.configs.env import (
     POLL_WAIT,
     PROFILE,
     VISIBILITY_TIMEOUT,
-    JobProcessingError,
     post_status,
 )
 from .pipeline.full_pipeline import FullPipeline
