@@ -1,5 +1,5 @@
 from typing import Any, Dict
-from app.config import JobProcessingError
+from app.config.utils import JobProcessingError
 import os, logging
 from app.config.env import DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, LOG_LEVEL
 from app.config.utils import post_status, ensure_workdir
