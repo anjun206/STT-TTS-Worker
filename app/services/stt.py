@@ -50,7 +50,7 @@ def _whisperx_download_root(subdir: str) -> str:
     return str(path)
 
 
-def run_asr(job_id: str):
+def run_asr(job_id: str, source_video_path: Path | str | None = None):
     """입력 영상을 WhisperX로 전사하고 화자 분리를 수행합니다."""
     paths = ensure_job_dirs(job_id)
     hf_token = (
@@ -61,9 +61,13 @@ def run_asr(job_id: str):
     )
 
     # 파일 경로 구성
-    input_video = paths.input_dir / "source.mp4"
+    if source_video_path:
+        input_video = Path(source_video_path)
+    else:
+        input_video = paths.input_dir / "source.mp4"
+    
     if not input_video.is_file():
-        raise FileNotFoundError(f"Input video not found for job {job_id}")
+        raise FileNotFoundError(f"Input video not found for job {job_id} at {input_video}")
     raw_audio_path = paths.vid_speaks_dir / "audio.wav"
 
     # 1. 영상에서 오디오 추출 (Whisper 권장 형식: 모노 16kHz)
@@ -89,7 +93,7 @@ def run_asr(job_id: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Loading WhisperX ASR model (device=%s)", device)
     model = whisperx.load_model(
-        "large-v2",
+        "base",
         device=device,
         download_root=_whisperx_download_root("asr"),
     )  # 정확도를 위해 large 모델 사용

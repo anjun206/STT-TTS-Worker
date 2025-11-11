@@ -48,7 +48,7 @@ def _time_stretch(input_path: Path, ratio: float) -> AudioSegment:
             "tempo",
             f"{tempo_factor:.6f}",
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, timeout=600)  # 10분 타임아웃
         return AudioSegment.from_wav(str(temp_output))
     finally:
         if temp_output.exists():

@@ -1,30 +1,60 @@
 services:
-  worker:
-    container_name: dubbing-worker
+  api:
+    container_name: dubbing-api
     build:
-      context: .
+      context: ./app
       dockerfile: Dockerfile
       target: runtime
     image: dubbing-worker:latest
+    command: sh -c "uvicorn main:app --host 0.0.0.0 --port 8000"
     ports:
-      - "8000:8000"
+      - "18000:8000"
     volumes:
       - ./app:/app
       - ./data:/data
       - ./models:/models
+      - ~/.aws:/root/.aws:ro
     env_file:
       - .env
     environment:
-      - UVICORN_RELOAD=${UVICORN_RELOAD---reload}
+      - AWS_PROFILE=dev
+      - AWS_REGION=ap-northeast-2
+      - AWS_S3_BUCKET=dupilot-dev-media
+      - JOB_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/148761638563/test-dupilot-queue.fifo
+      - JOB_CALLBACK_BASE_URL=http://host.docker.internal:8000
       - DATA_DIR=/data
-      - INPUTS_DIR=/data/inputs
-      - INTERIM_DIR=/data/interim
-      - OUTPUTS_DIR=/data/outputs
       - MODELS_DIR=/models
       - WHISPERX_CACHE_DIR=/models/.cache/whisperx
       - XDG_CACHE_HOME=/models/.cache
-      - CUDA_HOME=${CUDA_HOME-/usr/local/cuda}
-      # 컨테이너 내부 기본값으로 PYTHONPATH 지정 (호스트에 같은 이름 env가 있으면 그 값을 사용)
-      - PYTHONPATH=${PYTHONPATH-/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS}
+      - PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS
+    gpus: all
+    restart: unless-stopped
+
+  worker:
+    container_name: dubbing-worker
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      target: runtime
+    image: dubbing-worker:latest
+    command: python worker.py
+    volumes:
+      - ./app:/app
+      - ./data:/data
+      - ./models:/models
+      - ~/.aws:/root/.aws:ro
+    env_file:
+      - .env
+    environment:
+      - AWS_PROFILE=dev
+      - AWS_REGION=ap-northeast-2
+      - AWS_S3_BUCKET=dupilot-dev-media
+      - JOB_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/148761638563/test-dupilot-queue.fifo
+      - JOB_CALLBACK_BASE_URL=http://host.docker.internal:8000
+      - DATA_DIR=/data
+      - MODELS_DIR=/models
+      - WHISPERX_CACHE_DIR=/models/.cache/whisperx
+      - XDG_CACHE_HOME=/models/.cache
+      - PYTHONPATH=/opt/CosyVoice:/opt/CosyVoice/third_party/Matcha-TTS
     gpus: all
     restart: unless-stopped

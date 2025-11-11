@@ -1,14 +1,31 @@
-from typing import Optional, Dict, Any
-import requests
-from app.config.env import CALLBACK_LOCALHOST_HOST
-from urllib.parse import urlparse, urlunparse
+from __future__ import annotations
+
 import os
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse, urlunparse
+
+import requests
+
+from .env import CALLBACK_LOCALHOST_HOST
+
 
 class JobProcessingError(Exception):
     """Raised when a job fails irrecoverably during processing."""
 
+
+def normalize_callback_url(callback_url: str) -> str:
+    parsed = urlparse(callback_url)
+    if parsed.hostname in {"localhost", "127.0.0.1"} and CALLBACK_LOCALHOST_HOST:
+        host = CALLBACK_LOCALHOST_HOST
+        netloc = host
+        if parsed.port:
+            netloc = f"{host}:{parsed.port}"
+        parsed = parsed._replace(netloc=netloc)
+    return urlunparse(parsed)
+
+
 def post_status(
-    self,
+    http: requests.Session,
     callback_url: str,
     status: str,
     *,
@@ -36,10 +53,10 @@ def post_status(
     if metadata is not None:
         payload["metadata"] = metadata
 
-    target_url = __normalize_callback_url(callback_url)
+    target_url = normalize_callback_url(callback_url)
 
     try:
-        resp = self.http.post(target_url, json=payload, timeout=30)
+        resp = http.post(target_url, json=payload, timeout=30)
     except requests.RequestException as exc:
         raise JobProcessingError(f"Callback request failed: {exc}") from exc
 
@@ -47,20 +64,6 @@ def post_status(
         raise JobProcessingError(
             f"Callback responded with {resp.status_code}: {resp.text[:200]}"
         )
-
-
-def __normalize_callback_url(call_back_url) -> str:
-    parsed = urlparse(call_back_url)
-    if (
-        parsed.hostname in {"localhost", "127.0.0.1"}
-        and CALLBACK_LOCALHOST_HOST
-    ):
-        host = CALLBACK_LOCALHOST_HOST
-        netloc = host
-        if parsed.port:
-            netloc = f"{host}:{parsed.port}"
-        parsed = parsed._replace(netloc=netloc)
-    return urlunparse(parsed)
 
 
 def ensure_workdir(job_id: str) -> str:

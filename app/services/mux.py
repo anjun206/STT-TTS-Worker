@@ -3,18 +3,20 @@ import os
 import subprocess
 from pydub import AudioSegment
 from config import get_job_paths
+from pathlib import Path
 
 
-def mux_audio_video(job_id: str):
+def mux_audio_video(job_id: str, video_input_path: Path):
     """합성 음성과 배경음을 결합하고 원본 영상에 다시 입혀 최종 영상을 생성합니다."""
     paths = get_job_paths(job_id)
     background_path = paths.vid_bgm_dir / "background.wav"
     base_tts_dir = paths.vid_tts_dir
     synced_dir = base_tts_dir / "synced"
     tts_dir = synced_dir if synced_dir.is_dir() else base_tts_dir
-    video_input = paths.input_dir / "source.mp4"
+    
+    video_input = video_input_path
     if not video_input.is_file():
-        raise RuntimeError("Original video file not found for muxing.")
+        raise RuntimeError(f"Original video file not found for muxing at {video_input}")
     if not background_path.is_file():
         raise FileNotFoundError("Background audio not found. Run Demucs stage.")
     if not tts_dir.is_dir():
@@ -79,7 +81,7 @@ def mux_audio_video(job_id: str):
         "-shortest",
         str(output_video_path),
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=600)  # 10분 타임아웃
     return {
         "output_video": str(output_video_path),
         "output_audio": str(final_audio_path),
