@@ -31,7 +31,7 @@ try:
     from whisperx.diarize import DiarizationPipeline
 except ImportError:  # WhisperX<3.7 fallback
     from whisperx import DiarizationPipeline
-from configs import WHISPERX_CACHE_DIR, ensure_job_dirs
+from app.configs.config import WHISPERX_CACHE_DIR, ensure_job_dirs
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     build_compact_transcript,

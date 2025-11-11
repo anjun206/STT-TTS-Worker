@@ -13,7 +13,7 @@ from services.translate import translate_transcript
 from services.tts import generate_tts
 from services.mux import mux_audio_video
 from services.sync import sync_segments
-from configs import ensure_data_dirs, ensure_job_dirs
+from app.configs.config import ensure_data_dirs, ensure_job_dirs
 
 
 # 문서화를 위한 요청/응답 모델 정의
