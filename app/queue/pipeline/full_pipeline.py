@@ -13,9 +13,8 @@ from app.configs.env import (
     DEFAULT_TARGET_LANG,
     LOG_LEVEL,
     ensure_job_dirs,
-    post_status,
 )
-from app.configs.utils import JobProcessingError
+from app.configs.utils import JobProcessingError, post_status
 from app.services.mux import mux_audio_video
 from app.services.stt import run_asr
 from app.services.sync import sync_segments
