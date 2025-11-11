@@ -4,7 +4,8 @@ import uuid
 import json
 import shutil
 import shlex
-from typing import Optional, List, Dict
+import logging
+from typing import Optional, List, Dict, Any, Tuple
 from faster_whisper import WhisperModel
 from fastapi import UploadFile
 from .translate import translate_texts
@@ -29,20 +30,28 @@ from .utils import (
 )
 from .utils_meta import load_meta, save_meta
 from .vad import (
-    compute_vad_silences,
     sum_silence_between,
     complement_intervals,
     merge_intervals,
 )
 
-from typing import Tuple
-
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # base|small|medium|large-v3
 TTS_MODEL = os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2")
+WHISPER_BACKEND = os.getenv("WHISPER_BACKEND", "whisperx").strip().lower()
+WHISPER_BACKEND_STRICT = os.getenv("WHISPER_BACKEND_STRICT", "0") == "1"
 
 USE_GPU = os.getenv("USE_GPU", "1") == "1"
 _device = "cuda" if USE_GPU else "cpu"
 _compute = "float16" if _device == "cuda" else "int8"
+logger = logging.getLogger(__name__)
+
+WHISPERX_BATCH_SIZE = int(os.getenv("WHISPERX_BATCH_SIZE", "16"))
+WHISPERX_ALIGN = os.getenv("WHISPERX_ALIGN", "1") == "1"
+_DEFAULT_MARGIN = "0.00" if WHISPER_BACKEND == "whisperx" else "0.10"
+
+_WHISPERX_MODEL: Any = None
+_WHISPERX_ALIGNERS: Dict[str, Tuple[Any, Any]] = {}
+_WHISPERX_MODULE: Any = None
 
 EPS = 0.02  # 20ms 허용오차
 
@@ -64,6 +73,91 @@ def _annotate_segments(segments: List[Dict]) -> List[Dict]:
         seg.setdefault("issues", [])
         seg.setdefault("score", None)
     return segments
+
+
+def generate_segment_clips(
+    meta: Dict[str, Any],
+    include_video: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    WhisperX 세그먼트 기준으로 원본 화자 음성과 영상을 잘라 로컬에 저장.
+    반환: [{"index": int, "source": path, "video": path?}, ...]
+    """
+    segments = meta.get("segments") or []
+    if not segments:
+        return []
+
+    workdir = meta.get("workdir")
+    if not workdir:
+        return []
+    segment_dir = os.path.join(workdir, "segments")
+    _ensure_dir(segment_dir)
+
+    speech_src = (
+        meta.get("speech_only_48k")
+        or meta.get("vocals_48k")
+        or meta.get("audio_full_48k")
+    )
+    video_src = meta.get("input") if include_video else None
+    if not speech_src and not video_src:
+        return []
+
+    produced: List[Dict[str, Any]] = []
+    for idx, seg in enumerate(segments):
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if end <= start + 1e-3:
+            continue
+        base = f"{idx:04d}"
+        entry: Dict[str, Any] = {"index": idx}
+
+        if speech_src:
+            source_path = os.path.join(segment_dir, f"{base}_source.wav")
+            if not os.path.exists(source_path):
+                run(
+                    " ".join(
+                        [
+                            "ffmpeg -y",
+                            f"-ss {start:.6f}",
+                            f"-to {end:.6f}",
+                            f"-i {shlex.quote(speech_src)}",
+                            "-ar 16000",
+                            "-ac 1",
+                            "-c:a pcm_s16le",
+                            shlex.quote(source_path),
+                        ]
+                    )
+                )
+            entry["source"] = source_path
+
+        if video_src:
+            video_path = os.path.join(segment_dir, f"{base}_video.mp4")
+            if not os.path.exists(video_path):
+                duration = max(0.05, end - start)
+                run(
+                    " ".join(
+                        [
+                            "ffmpeg -y",
+                            f"-ss {start:.6f}",
+                            f"-i {shlex.quote(video_src)}",
+                            f"-t {duration:.6f}",
+                            "-map 0:v:0",
+                            "-map 0:a:0?",
+                            "-c:v copy",
+                            "-c:a copy",
+                            "-movflags +faststart",
+                            shlex.quote(video_path),
+                        ]
+                    )
+                )
+            entry["video"] = video_path
+
+        if len(entry) > 1:
+            produced.append(entry)
+    return produced
 
 
 def _extract_tracks(in_path: str, work: str) -> Tuple[str, str, str, str]:
@@ -98,15 +192,118 @@ def _pick_ref(audio_wav_16k: str, out_ref_24k: str):
     run(f"ffmpeg -y -i {audio_wav_16k} -t 6 -ar 24000 -ac 1 {out_ref_24k}")
 
 
-def _whisper_transcribe(audio_wav_16k: str):
+def _ensure_whisperx_module():
+    global _WHISPERX_MODULE
+    if _WHISPERX_MODULE is None:
+        try:
+            import whisperx  # type: ignore
+        except ImportError as exc:  # pragma: no cover - runtime guard
+            raise RuntimeError(
+                "whisperx backend requested but whisperx is not installed. "
+                "Please add whisperx to requirements or set WHISPER_BACKEND=faster."
+            ) from exc
+        _WHISPERX_MODULE = whisperx
+    return _WHISPERX_MODULE
+
+
+def _get_whisperx_model():
+    global _WHISPERX_MODEL
+    if _WHISPERX_MODEL is None:
+        whisperx = _ensure_whisperx_module()
+        logger.info("Loading WhisperX model '%s' on %s (%s)", WHISPER_MODEL, _device, _compute)
+        _WHISPERX_MODEL = whisperx.load_model(
+            WHISPER_MODEL,
+            device=_device,
+            compute_type=_compute,
+        )
+    return _WHISPERX_MODEL
+
+
+def _get_whisperx_align_model(language: Optional[str]):
+    if not language:
+        return None
+    lang = language.split("-")[0].lower()
+    if not lang:
+        return None
+    if lang in _WHISPERX_ALIGNERS:
+        return _WHISPERX_ALIGNERS[lang]
+    whisperx = _ensure_whisperx_module()
+    try:
+        align_model, metadata = whisperx.load_align_model(
+            language_code=lang,
+            device=_device,
+        )
+    except Exception as exc:  # pragma: no cover - depends on env/models
+        logger.warning("Failed to load WhisperX align model for %s: %s", lang, exc)
+        return None
+    _WHISPERX_ALIGNERS[lang] = (align_model, metadata)
+    return _WHISPERX_ALIGNERS[lang]
+
+
+def _transcribe_with_whisperx(audio_wav_16k: str) -> List[Dict[str, Any]]:
+    whisperx = _ensure_whisperx_module()
+    model = _get_whisperx_model()
+    audio = whisperx.load_audio(audio_wav_16k)
+    lang_hint = os.getenv("WHISPER_LANG")
+    result = model.transcribe(
+        audio,
+        batch_size=WHISPERX_BATCH_SIZE,
+        language=lang_hint if lang_hint else None,
+    )
+    segments = result.get("segments") or []
+    if WHISPERX_ALIGN:
+        align_bundle = _get_whisperx_align_model(result.get("language"))
+        if align_bundle is not None:
+            align_model, metadata = align_bundle
+            try:
+                aligned = whisperx.align(
+                    segments,
+                    align_model,
+                    metadata,
+                    audio,
+                    device=_device,
+                    return_char_alignments=False,
+                )
+                segments = aligned.get("segments") or segments
+            except Exception as exc:  # pragma: no cover - depends on env/models
+                logger.warning("WhisperX alignment failed, using raw segments: %s", exc)
+
+    outs: List[Dict[str, Any]] = []
+    for seg in segments:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        text = (seg.get("text") or "").strip()
+        out: Dict[str, Any] = {"start": start, "end": end, "text": text}
+        if "words" in seg:
+            out["words"] = seg["words"]
+        outs.append(out)
+    return outs
+
+
+def _transcribe_with_faster_whisper(audio_wav_16k: str) -> List[Dict[str, Any]]:
     model = WhisperModel(WHISPER_MODEL, device=_device, compute_type=_compute)
-    segments, info = model.transcribe(
+    segments, _info = model.transcribe(
         audio_wav_16k, language=None, vad_filter=True, word_timestamps=False
     )
     return [
         {"start": float(s.start), "end": float(s.end), "text": s.text.strip()}
         for s in segments
     ]
+
+
+def _whisper_transcribe(audio_wav_16k: str):
+    if WHISPER_BACKEND == "whisperx":
+        try:
+            return _transcribe_with_whisperx(audio_wav_16k)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(
+                "WhisperX backend failed (%s); falling back to faster-whisper. "
+                "Set WHISPER_BACKEND_STRICT=1 to raise instead.",
+                exc,
+            )
+            if WHISPER_BACKEND_STRICT:
+                raise
+    return _transcribe_with_faster_whisper(audio_wav_16k)
 
 
 def _ensure_ref_voice(work: str, wav_16k: str, ref_voice: Optional[UploadFile]) -> str:
@@ -446,19 +643,11 @@ async def asr_only(file: UploadFile) -> Dict:
     full_48k, vocals_48k, bgm_48k, vocals_16k_raw = _extract_tracks(in_path, work)
     total = ffprobe_duration(full_48k)
 
-    # 2) (참고용) VAD 침묵 구간: gap 계산에만 사용
-    silences = compute_vad_silences(
-        vocals_16k_raw,
-        aggressiveness=int(os.getenv("VAD_AGGR", "3")),
-        frame_ms=int(os.getenv("VAD_FRAME_MS", "30")),
-    )
-
-    # 3) STT는 raw 보이스(=사람말+울음 포함)에서 직접 돌리기보다,
-    #    일단 raw 보이스 16k 그대로 돌립니다. (울음 구간은 대부분 비문/공백)
+    # 2) WhisperX 기반 STT (분리된 보이스 사용)
     segments = _whisper_transcribe(vocals_16k_raw)
 
-    # 4) STT 세그 기반 speech 구간(여유 margin 포함) 산출
-    margin = float(os.getenv("STT_INTERVAL_MARGIN", "0.10"))  # ±100ms
+    # 3) STT 세그 기반 speech 구간(여유 margin 포함) 산출
+    margin = float(os.getenv("STT_INTERVAL_MARGIN", _DEFAULT_MARGIN))
     stt_intervals = merge_intervals(
         [
             (
@@ -470,29 +659,27 @@ async def asr_only(file: UploadFile) -> Dict:
         ]
     )
 
-    # 5) 사람말 전용/FX 트랙 만들기 (타임라인 보존)
+    # 4) 사람말 전용/FX 트랙 만들기 (타임라인 보존)
     speech_only_48k = os.path.join(work, "speech_only_48k.wav")
     vocals_fx_48k = os.path.join(work, "vocals_fx_48k.wav")
     mask_keep_intervals(vocals_48k, stt_intervals, speech_only_48k, sr=48000, ac=2)
     nonspeech_intervals = complement_intervals(stt_intervals, total)
     mask_keep_intervals(vocals_48k, nonspeech_intervals, vocals_fx_48k, sr=48000, ac=2)
 
-    # 6) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
+    # 5) STT/후속 처리는 "사람말만 담긴" 트랙에서 진행 (타임라인 동일)
     wav_16k = os.path.join(work, "speech_16k.wav")
     run(
         f"ffmpeg -y -i {shlex.quote(speech_only_48k)} -ac 1 -ar 16000 -c:a pcm_s16le {shlex.quote(wav_16k)}"
     )
 
-    # 필요시, segments를 speech_only에서 재추출하고 싶다면 아래로 대체:
-    # segments = _whisper_transcribe(wav_16k)
-
-    # 7) gap 기록(VAD 기준; 원본 타임라인 유지)
+    # 6) gap 기록(WhisperX 세그먼트 간 차이 사용)
     for i in range(len(segments)):
         if i < len(segments) - 1:
             st = float(segments[i]["end"])
             en = float(segments[i + 1]["start"])
-            segments[i]["gap_after_vad"] = sum_silence_between(silences, st, en)
-            segments[i]["gap_after"] = max(0.0, en - st)
+            gap = max(0.0, en - st)
+            segments[i]["gap_after_vad"] = gap
+            segments[i]["gap_after"] = gap
         else:
             segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
@@ -511,10 +698,13 @@ async def asr_only(file: UploadFile) -> Dict:
         "wav_16k": wav_16k,  # ✅ 이후 파이프라인 입력
         "orig_duration": total,
         "segments": segments,
-        "silences": silences,
+        "silences": [],
         "speech_intervals_stt": stt_intervals,
         "nonspeech_intervals_stt": nonspeech_intervals,
     }
+    clips = generate_segment_clips(meta)
+    if clips:
+        meta["segment_original_assets"] = clips
     save_meta(work, meta)
     return meta
 
@@ -834,6 +1024,12 @@ def merge_segments_stage(job_id: str, merges: Optional[List[List[int]]] = None):
         "output",
     ):
         meta.pop(k, None)
+
+    clips = generate_segment_clips(meta)
+    if clips:
+        meta["segment_original_assets"] = clips
+    else:
+        meta.pop("segment_original_assets", None)
 
     save_meta(work, meta)
     return {"segments": merged, "merge_map": merge_map}

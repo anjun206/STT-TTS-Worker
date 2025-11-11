@@ -110,7 +110,14 @@ async def asr_endpoint(
     file: UploadFile = File(..., description="Video or audio file"),
 ):
     meta = await asr_only(file)
-    return JSONResponse({"job_id": meta["job_id"], "segments": meta["segments"], "workdir": meta["workdir"]})
+    return JSONResponse(
+        {
+            "job_id": meta["job_id"],
+            "segments": meta["segments"],
+            "workdir": meta["workdir"],
+            "segment_assets": meta.get("segment_original_assets", []),
+        }
+    )
 
 # (선택) PATCH 엔드포인트들: 안 써도 됩니다
 @app.patch("/segments/{job_id}")

@@ -18,6 +18,7 @@ from .pipeline import (
     _annotate_segments,
     _extract_tracks,
     _whisper_transcribe,
+    generate_segment_clips,
     mux_stage,
     translate_stage,
     tts_finalize_stage,
@@ -37,9 +38,7 @@ from .tts import synthesize
 from .utils_meta import load_meta, save_meta
 from .vad import (
     complement_intervals,
-    compute_vad_silences,
     merge_intervals,
-    sum_silence_between,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,15 +66,11 @@ def _run_asr_stage(job_id: str, input_path: str) -> Dict[str, Any]:
     full_48k, vocals_48k, bgm_48k, vocals_16k_raw = _extract_tracks(input_path, workdir)
     total = ffprobe_duration(full_48k)
 
-    silences = compute_vad_silences(
-        vocals_16k_raw,
-        aggressiveness=int(os.getenv("VAD_AGGR", "3")),
-        frame_ms=int(os.getenv("VAD_FRAME_MS", "30")),
-    )
-
     segments = _whisper_transcribe(vocals_16k_raw)
 
-    margin = float(os.getenv("STT_INTERVAL_MARGIN", "0.10"))
+    backend = os.getenv("WHISPER_BACKEND", "whisperx").strip().lower()
+    default_margin = "0.00" if backend == "whisperx" else "0.10"
+    margin = float(os.getenv("STT_INTERVAL_MARGIN", default_margin))
     stt_intervals = merge_intervals(
         [
             (
@@ -102,8 +97,9 @@ def _run_asr_stage(job_id: str, input_path: str) -> Dict[str, Any]:
         if i < len(segments) - 1:
             st = float(segments[i]["end"])
             en = float(segments[i + 1]["start"])
-            segments[i]["gap_after_vad"] = sum_silence_between(silences, st, en)
-            segments[i]["gap_after"] = max(0.0, en - st)
+            gap = max(0.0, en - st)
+            segments[i]["gap_after_vad"] = gap
+            segments[i]["gap_after"] = gap
         else:
             segments[i]["gap_after_vad"] = 0.0
             segments[i]["gap_after"] = 0.0
@@ -122,10 +118,13 @@ def _run_asr_stage(job_id: str, input_path: str) -> Dict[str, Any]:
         "wav_16k": wav_16k,
         "orig_duration": total,
         "segments": segments,
-        "silences": silences,
+        "silences": [],
         "speech_intervals_stt": stt_intervals,
         "nonspeech_intervals_stt": nonspeech_intervals,
     }
+    clips = generate_segment_clips(meta)
+    if clips:
+        meta["segment_original_assets"] = clips
     save_meta(workdir, meta)
     return meta
 
