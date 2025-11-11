@@ -2,7 +2,7 @@ services:
   api:
     container_name: dubbing-api
     build:
-      context: ./app
+      context: .
       dockerfile: Dockerfile
       target: runtime
     image: dubbing-worker:latest
@@ -33,7 +33,7 @@ services:
   worker:
     container_name: dubbing-worker
     build:
-      context: ./app
+      context: .
       dockerfile: Dockerfile
       target: runtime
     image: dubbing-worker:latest
