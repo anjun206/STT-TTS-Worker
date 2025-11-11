@@ -1,5 +1,5 @@
 import os
-from app.configs.env import JOB_QUEUE_URL, AWS_REGION, AWS_S3_BUCKET, DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, VISIBILITY_TIMEOUT, POLL_WAIT, CALLBACK_LOCALHOST_HOST, PROFILE, LOG_LEVEL
+from app.configs.env import JOB_QUEUE_URL, AWS_REGION, AWS_S3_BUCKET, VISIBILITY_TIMEOUT, POLL_WAIT, CALLBACK_LOCALHOST_HOST, PROFILE, LOG_LEVEL
 from botocore.exceptions import BotoCoreError, ClientError
 import logging, time, requests, boto3, json
 from app.configs.utils import JobProcessingError
@@ -17,8 +17,6 @@ class QueueWorker:
     def __init__(self):
         self.queue_url = JOB_QUEUE_URL
         self.bucket = AWS_S3_BUCKET
-        self.default_target_lang = DEFAULT_TARGET_LANG
-        self.default_source_lang = DEFAULT_SOURCE_LANG
         self.visibility_timeout = VISIBILITY_TIMEOUT
         self.poll_wait = POLL_WAIT
         self.callback_localhost_host = CALLBACK_LOCALHOST_HOST

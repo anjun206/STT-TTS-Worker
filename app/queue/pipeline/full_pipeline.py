@@ -1,7 +1,7 @@
 from typing import Any, Dict
 from app.configs.utils import JobProcessingError
 import os, logging
-from app.configs.env import DEFAULT_TARGET_LANG, DEFAULT_SOURCE_LANG, LOG_LEVEL
+from app.configs.env import DEFAULT_TARGET_LANG, LOG_LEVEL
 from app.configs.utils import post_status, ensure_workdir
 from app.services.stt import run_asr
 from app.services.translate import translate_transcript
@@ -26,7 +26,6 @@ class FullPipeline:
         self.callback_url = payload.get("callback_url")
         self.__validation_check()
         self.target_lang = payload.get("target_lang") or DEFAULT_TARGET_LANG
-        self.source_lang = payload.get("source_lang") or DEFAULT_SOURCE_LANG
         self.workdir = ensure_workdir(self.job_id)
         self.extension = os.path.splitext(self.input_key)[1]
         self.local_input = os.path.join(self.workdir, f"input{self.extension or '.mp4'}")

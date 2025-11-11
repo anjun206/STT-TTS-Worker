@@ -11,6 +11,8 @@ POLL_WAIT = int(os.getenv('JOB_QUEUE_WAIT', '20'))
 CALLBACK_LOCALHOST_HOST = os.getenv('JOB_CALLBACK_LOCALHOST_HOST', 'host.docker.internal')
 PROFILE = os.getenv('AWS_PROFILE', 'dev')
 LOG_LEVEL = os.getenv("WORKER_LOG_LEVEL", "INFO")
+DEFAULT_TARGET_LANG = os.getenv("DEFAULT_TARGET_LANG", "ko")
+DEFAULT_SOURCE_LANG = os.getenv("DEFAULT_SOURCE_LANG", "en")
 
 
 
