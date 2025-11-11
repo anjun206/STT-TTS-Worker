@@ -10,7 +10,7 @@ from typing import Dict, List
 
 from pydub import AudioSegment
 
-from config import get_job_paths
+from configs import get_job_paths
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,

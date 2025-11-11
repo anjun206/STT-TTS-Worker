@@ -2,7 +2,7 @@
 import subprocess
 import shutil
 
-from config import get_job_paths
+from configs import get_job_paths
 
 
 def split_vocals(job_id: str):

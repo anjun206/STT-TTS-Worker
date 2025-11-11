@@ -7,7 +7,7 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.config import (
+from app.configs.env import (
     JOB_QUEUE_URL,
     AWS_REGION,
     AWS_S3_BUCKET,

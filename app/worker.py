@@ -15,7 +15,7 @@ from services.translate import translate_transcript
 from services.tts import generate_tts
 from services.sync import sync_segments
 from services.mux import mux_audio_video
-from config import ensure_job_dirs
+from configs import ensure_job_dirs
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
