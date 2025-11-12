@@ -279,6 +279,7 @@ class FullPipeline:
         translations: list[Dict[str, Any]],
         audio_path: Path,
     ) -> Dict[str, Any]:
+        normalized_segments = self._segments_with_remote_audio(segments)
         return {
             "job_id": self.job_id,
             "project_id": self.project_id,
@@ -289,8 +290,42 @@ class FullPipeline:
             "result_bucket": self.output_bucket,
             "result_key": self.result_key,
             "metadata_key": self.metadata_key,
-            "segments": segments,
-            "segment_count": len(segments),
+            "segments": normalized_segments,
+            "segment_count": len(normalized_segments),
             "translations": translations,
             "audio_artifact": str(audio_path),
         }
+
+    def _segments_with_remote_audio(
+        self, segments: list[Dict[str, Any]]
+    ) -> list[Dict[str, Any]]:
+        if not segments:
+            return []
+        project_prefix = f"projects/{self.project_id}" if self.project_id else "jobs"
+        remote_prefix = f"{project_prefix}/interim/{self.job_id}"
+        base_dir = self.paths.interim_dir
+        normalized: list[Dict[str, Any]] = []
+        for segment in segments:
+            updated = dict(segment)
+            audio_value = updated.get("audio_file")
+            if isinstance(audio_value, str):
+                if audio_value.startswith("s3://") or audio_value.startswith(
+                    remote_prefix
+                ):
+                    normalized.append(updated)
+                    continue
+                candidate = Path(audio_value)
+                try:
+                    relative_path = candidate.relative_to(base_dir)
+                except ValueError:
+                    logger.debug(
+                        "audio_file 경로 %s 가 %s 기준 상대 경로가 아니어서 그대로 둡니다.",
+                        candidate,
+                        base_dir,
+                    )
+                else:
+                    updated["audio_file"] = (
+                        f"{remote_prefix}/{relative_path.as_posix()}"
+                    )
+            normalized.append(updated)
+        return normalized

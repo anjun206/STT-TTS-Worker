@@ -156,7 +156,13 @@ def run_asr(
     # 5. pyannote 기반 화자 분리 (모델 접근을 위해 HF 토큰 필요)
     if hf_token:
         logger.info("Initializing WhisperX diarization pipeline via pyannote")
+        diarization_model = (
+            os.getenv("PYANNOTE_DIARIZATION_MODEL")
+            or os.getenv("WHISPERX_DIARIZATION_MODEL")
+            or "pyannote/speaker-diarization-3.1"
+        )
         diarization_pipeline = DiarizationPipeline(
+            diarization_model,
             use_auth_token=hf_token,
             device=device,
         )
