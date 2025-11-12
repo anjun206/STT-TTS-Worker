@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
       target: runtime
     image: dubbing-worker:latest
-    command: ["python", "-m", "app.queue.worker"]
+    command: ["python", "-m", "queue.worker"]
     ports:
       - "8000:8000"
     volumes:
