@@ -185,7 +185,7 @@ def full_pipeline(job_details: dict):
     try:
         # 4. ASR (STT)
         send_callback(callback_url, "in_progress", "Starting ASR...", stage="asr_started")
-        run_asr(job_id, source_video_path)
+        run_asr(job_id, source_video_path, source_lang=source_lang)
         # ASR 결과물(compact transcript)을 S3에 업로드
         from services.transcript_store import COMPACT_ARCHIVE_NAME
 

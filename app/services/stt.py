@@ -50,8 +50,23 @@ def _whisperx_download_root(subdir: str) -> str:
     return str(path)
 
 
-def run_asr(job_id: str, source_video_path: Path | str | None = None):
-    """입력 영상을 WhisperX로 전사하고 화자 분리를 수행합니다."""
+def run_asr(
+    job_id: str,
+    source_video_path: Path | str | None = None,
+    source_lang: str | None = None,
+):
+    """입력 영상을 WhisperX로 전사하고 화자 분리를 수행합니다.
+
+    Args:
+        job_id: 작업 식별자.
+        source_video_path: 명시된 경우 해당 경로에서 오디오를 추출합니다.
+        source_lang: 백엔드에서 지정한 원본 언어 코드(예: 'ko', 'en').
+            지정되면 WhisperX가 언어를 자동으로 추론하지 않고 해당 언어를 사용합니다.
+    """
+    lang_override = source_lang.strip() if isinstance(source_lang, str) else None
+    if lang_override and lang_override.lower() == "auto":
+        lang_override = None
+
     paths = ensure_job_dirs(job_id)
     hf_token = (
         os.getenv("HF_TOKEN")
@@ -103,13 +118,19 @@ def run_asr(job_id: str, source_video_path: Path | str | None = None):
     # 3. 단어 정렬 전 단계: 오디오 전사 후 구간 정보 확보
     audio = whisperx.load_audio(str(vocals_audio_path))
     logger.info("Running ASR transcription via WhisperX")
-    result = model.transcribe(audio)
+    transcribe_kwargs = {}
+    if lang_override:
+        transcribe_kwargs["language"] = lang_override
+    result = model.transcribe(audio, **transcribe_kwargs)
+    if lang_override:
+        result["language"] = lang_override
     segments = result["segments"]  # 텍스트와 대략적인 타임스탬프 포함
 
     # 4. 정밀한 타이밍을 위한 정렬 모델 로드
-    logger.info("Loading alignment model for language=%s", result["language"])
+    language_code = result.get("language")
+    logger.info("Loading alignment model for language=%s", language_code)
     align_kwargs = {
-        "language_code": result["language"],
+        "language_code": language_code,
         "device": device,
     }
     align_root = _whisperx_download_root("align")

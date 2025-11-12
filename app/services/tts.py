@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict
@@ -112,6 +115,54 @@ def _get_prompt_stt_model():
         device=device,
         compute_type=compute_type,
     )
+
+
+def _strip_background_from_sample(sample_path: Path, work_dir: Path) -> Path:
+    """Use Demucs two-stem separation to isolate vocals from a custom voice sample."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="demucs_user_", dir=str(work_dir)) as tmpdir:
+            output_dir = Path(tmpdir)
+            cmd = [
+                "python3",
+                "-m",
+                "demucs.separate",
+                "-d",
+                device,
+                "-n",
+                "htdemucs",
+                "--two-stems",
+                "vocals",
+                "-o",
+                str(output_dir),
+                str(sample_path),
+            ]
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            demucs_dir = output_dir / "htdemucs" / sample_path.stem
+            vocals_path = demucs_dir / "vocals.wav"
+            if vocals_path.is_file():
+                cleaned = work_dir / "user_voice_sample_vocals.wav"
+                shutil.copyfile(vocals_path, cleaned)
+                return cleaned
+            logger.warning(
+                "Demucs 결과에서 보컬 트랙을 찾지 못했습니다: %s", vocals_path
+            )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        logger.warning(
+            "사용자 보이스 샘플 배경 제거 실패 (%s, device=%s): %s",
+            sample_path,
+            device,
+            exc,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("보이스 샘플 정제 중 알 수 없는 오류 발생 (%s): %s", sample_path, exc)
+    return sample_path
 
 
 def _transcribe_prompt_text(sample_path: Path) -> str:
@@ -311,8 +362,9 @@ def generate_tts(
     if voice_sample_path:
         candidate = Path(voice_sample_path)
         if candidate.is_file():
+            cleaned_candidate = _strip_background_from_sample(candidate, tts_dir)
             try:
-                user_audio = AudioSegment.from_file(str(candidate))
+                user_audio = AudioSegment.from_file(str(cleaned_candidate))
                 normalized_user_sample = tts_dir / "user_voice_sample.wav"
                 user_audio.set_frame_rate(16000).set_channels(1).export(
                     normalized_user_sample, format="wav"
@@ -320,10 +372,10 @@ def generate_tts(
             except Exception as exc:
                 logger.warning(
                     "사용자 보이스 샘플 변환 실패 (%s), 원본을 그대로 사용합니다: %s",
-                    candidate,
+                    cleaned_candidate,
                     exc,
                 )
-                normalized_user_sample = candidate
+                normalized_user_sample = cleaned_candidate
         else:
             logger.warning("제공된 보이스 샘플을 찾을 수 없습니다: %s", candidate)
 

@@ -91,7 +91,7 @@ class FullPipeline:
             )
 
             # 2) ASR → 번역 → TTS → 싱크 순서로 미디어를 준비한다.
-            run_asr(self.job_id)
+            run_asr(self.job_id, source_lang=self.source_lang)
             self._post_stage("stt_completed")
 
             self._post_stage("mt_prepare")
