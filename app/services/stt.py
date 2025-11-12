@@ -65,9 +65,11 @@ def run_asr(job_id: str, source_video_path: Path | str | None = None):
         input_video = Path(source_video_path)
     else:
         input_video = paths.input_dir / "source.mp4"
-    
+
     if not input_video.is_file():
-        raise FileNotFoundError(f"Input video not found for job {job_id} at {input_video}")
+        raise FileNotFoundError(
+            f"Input video not found for job {job_id} at {input_video}"
+        )
     raw_audio_path = paths.vid_speaks_dir / "audio.wav"
 
     # 1. 영상에서 오디오 추출 (Whisper 권장 형식: 모노 16kHz)
