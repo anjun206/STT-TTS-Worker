@@ -1,8 +1,8 @@
 # translate.py
 import json
 import shutil
-from configs import get_job_paths
-from services.transcript_store import (
+from app.configs.config import get_job_paths
+from app.services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
     segment_views,

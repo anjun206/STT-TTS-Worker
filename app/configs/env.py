@@ -4,10 +4,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 JOB_QUEUE_URL = os.getenv(
-    "JOB_QUEUE_URL",
+    "SQS_QUEUE_URL",
     "https://sqs.ap-northeast-2.amazonaws.com/148761638563/test-dupilot-queue.fifo",
 )
-AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET", "dupilot-dev-media")
+AWS_S3_BUCKET = os.getenv("S3_BUCKET", "dupilot-dev-media")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 VISIBILITY_TIMEOUT = int(os.getenv("JOB_VISIBILITY_TIMEOUT", "300"))
 POLL_WAIT = int(os.getenv("JOB_QUEUE_WAIT", "20"))

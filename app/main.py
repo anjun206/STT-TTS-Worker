@@ -7,13 +7,13 @@ import os
 from pathlib import Path
 
 # 파이프라인 각 단계를 담당하는 함수 불러오기
-from services.stt import run_asr
-from services.demucs_split import split_vocals
-from services.translate import translate_transcript
-from services.tts import generate_tts
-from services.mux import mux_audio_video
-from services.sync import sync_segments
-from configs import ensure_data_dirs, ensure_job_dirs
+from app.services.stt import run_asr
+from app.services.demucs_split import split_vocals
+from app.services.translate import translate_transcript
+from app.services.tts import generate_tts
+from app.services.mux import mux_audio_video
+from app.services.sync import sync_segments
+from app.configs.config import ensure_data_dirs, ensure_job_dirs
 
 
 # 문서화를 위한 요청/응답 모델 정의
