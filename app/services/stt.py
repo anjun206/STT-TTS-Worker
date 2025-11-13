@@ -110,10 +110,11 @@ def run_asr(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("Loading WhisperX ASR model (device=%s)", device)
     model = whisperx.load_model(
-        "base",
+        "large-v3",
         device=device,
+        compute_type="float16",  # GPU에서 성능·정확도 균형이 가장 좋음
         download_root=_whisperx_download_root("asr"),
-    )  # 정확도를 위해 large 모델 사용
+    )
 
     # 3. 단어 정렬 전 단계: 오디오 전사 후 구간 정보 확보
     audio = whisperx.load_audio(str(vocals_audio_path))

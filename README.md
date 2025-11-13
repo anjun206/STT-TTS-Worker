@@ -8,15 +8,15 @@
 
 ## 요구사항 파일
 
-| 파일                             | 용도                                                         |
-| -------------------------------- | ------------------------------------------------------------ |
-| `app/requirements/base.txt`      | numpy, ffmpeg 등 CUDA 위 공통 유틸                           |
-| `app/requirements/python.txt`    | FastAPI, uvicorn, pydantic 등 서버 공통 의존성               |
-| `app/requirements/whisperx.txt`  | WhisperX, faster-whisper, Demucs, Torch 계열 STT 전용 패키지 |
-| `app/requirements/cosyvoice.txt` | CosyVoice(ModelScope) 관련 패키지                            |
-| `app/requirements/extra.txt`     | gTTS, googletrans 등 선택 기능                               |
-| `app/requirements/pins.txt`      | 모든 pip install에 강제하는 버전 핀(예: `numpy>=1.26.4,<2`, `faster-whisper>=1.1,<2`)  |
-| `app/requirements.txt`           | 위 파일들을 `-r`로 모은 레거시 진입점 (여전히 호환성 유지용) |
+| 파일                             | 용도                                                                                  |
+| -------------------------------- | ------------------------------------------------------------------------------------- |
+| `app/requirements/base.txt`      | numpy, ffmpeg 등 CUDA 위 공통 유틸                                                    |
+| `app/requirements/python.txt`    | FastAPI, uvicorn, pydantic 등 서버 공통 의존성                                        |
+| `app/requirements/whisperx.txt`  | WhisperX, faster-whisper, Demucs, Torch 계열 STT 전용 패키지                          |
+| `app/requirements/cosyvoice.txt` | CosyVoice(ModelScope) 관련 패키지                                                     |
+| `app/requirements/extra.txt`     | gTTS, googletrans 등 선택 기능                                                        |
+| `app/requirements/pins.txt`      | 모든 pip install에 강제하는 버전 핀(예: `numpy>=1.26.4,<2`, `faster-whisper>=1.1,<2`) |
+| `app/requirements.txt`           | 위 파일들을 `-r`로 모은 레거시 진입점 (여전히 호환성 유지용)                          |
 
 ## Docker 빌드 단계
 
@@ -70,7 +70,14 @@ data/
     "v": 1,
     "speakers": ["SPEAKER_00", "SPEAKER_01"],
     "segments": [
-      { "s": 1955, "e": 18698, "sp": 0, "txt": "...", "gap": [4519,4519], "w_off": [0,23] }
+      {
+        "s": 1955,
+        "e": 18698,
+        "sp": 0,
+        "txt": "...",
+        "gap": [4519, 4519],
+        "w_off": [0, 23]
+      }
     ],
     "vocab": ["메사추세추주의", "케이프", "..."],
     "words": [
@@ -139,3 +146,50 @@ docker compose build --build-arg DOWNLOAD_COSYVOICE_MODELS=true worker
 1. 루트 `.env` 파일에 `HUGGINGFACE_TOKEN=hf_xxx` 형태로 저장합니다. (커밋 금지)
 2. `docker-compose.yml`이 `.env`를 `env_file`로 읽어 컨테이너 환경변수에 주입합니다.
 3. FastAPI `/asr` 엔드포인트는 더 이상 `hf_token` 입력을 받지 않으며, `run_asr`가 `HF_TOKEN`, `HUGGINGFACE_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `HUGGINGFACEHUB_API_TOKEN` 중 하나를 자동으로 찾아 pyannote diarization에 전달합니다.
+
+## Vertex AI 설정(번역)
+
+- 번역 단계(`services.translate.translate_transcript`)는 기본적으로 Vertex AI Gemini(Flash‑Lite) 모델을 사용합니다. 서비스 계정 JSON 기반 인증을 지원하며, 최소 10개 세그먼트를 묶어서 배치 번역합니다.
+
+### 사전 준비
+
+- GCP 프로젝트에서 Vertex AI API를 사용 설정합니다.
+- 서비스 계정을 만들고 적절한 권한(예: `roles/aiplatform.user`)을 부여합니다.
+- 서비스 계정 키(JSON)를 다운로드합니다.
+
+### 환경변수
+
+- `VERTEX_SERVICE_ACCOUNT_JSON` – 서비스 계정 JSON 파일 경로(컨테이너에서 접근 가능해야 함). 예: `/run/secrets/vertex_sa.json`
+- `VERTEX_PROJECT_ID` – GCP 프로젝트 ID(JSON에 포함되어 있으면 생략 가능)
+- `VERTEX_LOCATION` – 기본 `us-central1`
+- `VERTEX_GEMINI_MODEL` – 기본 `gemini-1.5-flash-8b` (경량/고속 번역용)
+- `MT_MIN_BATCH_SIZE` – 배치 최소 크기(기본 `10`)
+
+`.env` 예시:
+
+```
+VERTEX_SERVICE_ACCOUNT_JSON=/run/secrets/vertex_sa.json
+VERTEX_PROJECT_ID=your-gcp-project
+VERTEX_LOCATION=us-central1
+VERTEX_GEMINI_MODEL=gemini-1.5-flash-8b
+MT_MIN_BATCH_SIZE=10
+```
+
+Docker 실행 시, 서비스 계정 JSON 파일을 컨테이너에 마운트하거나 Docker secrets를 사용해 `/run/secrets/vertex_sa.json` 경로로 제공하세요.
+
+### 의존성
+
+- `google-cloud-aiplatform` 패키지를 추가했습니다. Docker 이미지를 다시 빌드해야 합니다.
+
+```
+docker compose build worker
+docker compose up -d
+```
+
+### 동작 개요
+
+- STT 결과의 세그먼트를 최소 10개 단위로 청크하여 각 청크를 한 번의 Gemini 호출로 번역합니다.
+- 프롬프트는 입력을 JSON 배열로 전달하고, 출력도 `[{"seg_idx", "translation"}]` 형태의 JSON 배열만 반환하도록 유도합니다.
+- 결과 파일은 다음 위치에 저장됩니다.
+  - `interim/<job_id>/text/trg/sentence/translated.json`
+  - `outputs/<job_id>/text/trg_translated.json`

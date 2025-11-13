@@ -1,4 +1,6 @@
 googletrans==4.0.0rc1
+# Vertex AI Gemini 클라이언트(생성형 AI)
+google-cloud-aiplatform>=1.60.0
 pydub==0.25.1
 gTTS==2.5.1
 boto3>=1.34

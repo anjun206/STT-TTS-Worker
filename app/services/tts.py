@@ -122,7 +122,9 @@ def _strip_background_from_sample(sample_path: Path, work_dir: Path) -> Path:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         work_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="demucs_user_", dir=str(work_dir)) as tmpdir:
+        with tempfile.TemporaryDirectory(
+            prefix="demucs_user_", dir=str(work_dir)
+        ) as tmpdir:
             output_dir = Path(tmpdir)
             cmd = [
                 "python3",
@@ -161,7 +163,9 @@ def _strip_background_from_sample(sample_path: Path, work_dir: Path) -> Path:
             exc,
         )
     except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("보이스 샘플 정제 중 알 수 없는 오류 발생 (%s): %s", sample_path, exc)
+        logger.warning(
+            "보이스 샘플 정제 중 알 수 없는 오류 발생 (%s): %s", sample_path, exc
+        )
     return sample_path
 
 
