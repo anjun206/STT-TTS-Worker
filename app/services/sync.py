@@ -18,8 +18,6 @@ from services.transcript_store import (
 )
 
 MAX_SLOW_RATIO = float(os.getenv("SYNC_MAX_SLOW_RATIO", "1.1"))
-LENGTH_TOLERANCE_MS = 20  # 밀리초
-
 
 def _resolve_audio_path(path_str: str, fallback_dir: Path) -> Path:
     path = Path(path_str)
@@ -55,14 +53,6 @@ def _time_stretch(input_path: Path, ratio: float) -> AudioSegment:
             temp_output.unlink()
 
 
-def _apply_balanced_padding(audio: AudioSegment, padding_ms: int) -> AudioSegment:
-    if padding_ms <= 0:
-        return audio
-    lead = AudioSegment.silent(duration=padding_ms // 2)
-    tail = AudioSegment.silent(duration=padding_ms - len(lead))
-    return lead + audio + tail
-
-
 def _sync_single_segment(
     audio_path: Path,
     target_ms: int,
@@ -77,32 +67,18 @@ def _sync_single_segment(
     if ratio <= 0:
         raise RuntimeError("목표 길이가 잘못되었습니다.")
 
-    ratio_to_apply = ratio
-    padding_added = 0
-    if ratio > 1.0:
-        ratio_to_apply = min(ratio, allow_ratio)
+    ratio_to_apply = ratio if ratio <= 1.0 else min(ratio, allow_ratio)
     stretched = _time_stretch(audio_path, ratio_to_apply)
-
-    if ratio > allow_ratio and len(stretched) < target_ms:
-        padding_needed = target_ms - len(stretched)
-        stretched = _apply_balanced_padding(stretched, padding_needed)
-        padding_added = padding_needed
-
-    if len(stretched) > target_ms + LENGTH_TOLERANCE_MS:
-        stretched = stretched[:target_ms]
-    elif len(stretched) < target_ms - LENGTH_TOLERANCE_MS:
-        pad_ms = target_ms - len(stretched)
-        stretched += AudioSegment.silent(duration=pad_ms)
-        padding_added += pad_ms
-
-    return stretched, ratio_to_apply, padding_added, current_ms
+    if len(stretched) <= 0:
+        raise RuntimeError("시간 조정 결과가 비정상입니다.")
+    return stretched, ratio_to_apply, 0, current_ms
 
 
 def sync_segments(job_id: str) -> List[Dict]:
     """
     번역/TTS 후 구간별 오디오를 원본 화자 길이에 맞게 보정합니다.
-    - 길이가 더 길다면 배속 제한 없이 줄임
-    - 길이가 짧다면 최대 1.1배까지 실제 오디오를 스트레치하고 남는 길이는 무음으로 보충
+    - 길이가 더 길면 배속(tempo up)으로만 맞추고 자르지 않음
+    - 길이가 짧으면 최대 MAX_SLOW_RATIO까지만 감속(tempo down)하고 남은 구간은 비워둠
     """
     paths = get_job_paths(job_id)
     transcript_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
