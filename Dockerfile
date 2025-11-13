@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev git ffmpeg sox libsox-dev libsndfile1 \
+    python3 python3-pip python3-dev git ffmpeg sox libsox-dev libsndfile1 rubberband-cli \
     build-essential nvidia-cuda-toolkit \
  && ln -s /usr/lib/nvidia-cuda-toolkit /usr/local/cuda || true \
  && rm -rf /var/lib/apt/lists/*

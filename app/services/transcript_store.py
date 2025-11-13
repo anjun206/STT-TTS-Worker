@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import List, Sequence
 
 SCHEMA_VERSION = 1
-COMPACT_ARCHIVE_NAME = "transcript.comp.json.gz"
+# 기본 저장 포맷을 gzip(.gz)에서 평문 JSON(.json)으로 변경
+# 기존 .gz 파일과의 호환을 위해 로드 시 자동 폴백을 지원합니다.
+COMPACT_ARCHIVE_NAME = "transcript.comp.json"
 
 
 def _to_ms(value) -> int | None:
@@ -199,23 +201,40 @@ def build_compact_transcript(
 
 
 def save_compact_transcript(bundle: dict, path: Path) -> None:
+    """Compact transcript를 평문 JSON으로 저장합니다.
+
+    기존에는 gzip(.gz) 압축으로 저장했으나, I/O 성능 이슈를 고려해
+    이제 기본은 `.json` 평문 파일로 저장합니다.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode(
-        "utf-8"
-    )
-    with gzip.open(path, "wb") as fh:
-        fh.write(payload)
+    text = json.dumps(bundle, ensure_ascii=False, separators=(",", ":"))
+    path.write_text(text, encoding="utf-8")
 
 
 def load_compact_transcript(path: Path) -> dict:
-    if not path.is_file():
-        raise FileNotFoundError(f"Transcript archive not found: {path}")
+    """Compact transcript 로드.
+
+    우선 지정된 경로를 시도하고, 없으면 `.gz` ↔ `.json` 상호 폴백을 시도합니다.
+    둘 다 없으면 FileNotFoundError.
+    """
+    candidate = path
+    if not candidate.is_file():
+        # 확장자 폴백(.json ↔ .gz)
+        if candidate.suffix == ".gz":
+            alt = candidate.with_suffix("")  # .gz 제거 → .json일 가능성
+        else:
+            alt = candidate.with_suffix(candidate.suffix + ".gz")
+        if alt.is_file():
+            candidate = alt
+        else:
+            raise FileNotFoundError(f"Transcript archive not found: {path}")
+
     data: bytes
-    if path.suffix == ".gz":
-        with gzip.open(path, "rb") as fh:
+    if candidate.suffix == ".gz":
+        with gzip.open(candidate, "rb") as fh:
             data = fh.read()
     else:
-        data = path.read_bytes()
+        data = candidate.read_bytes()
     return json.loads(data.decode("utf-8"))
 
 

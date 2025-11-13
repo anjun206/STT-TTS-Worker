@@ -14,6 +14,7 @@ services:
       - ./data:/data
       - ./models:/models
       - ~/.aws:/root/.aws:ro
+      - ./key/gcp-sa.json:/app/key/gcp-sa.json:ro
     env_file:
       - .env
     environment:
@@ -43,6 +44,7 @@ services:
       - ./data:/data
       - ./models:/models
       - ~/.aws:/root/.aws:ro
+      - ./key/gcp-sa.json:/app/key/gcp-sa.json:ro
     env_file:
       - .env
     environment:

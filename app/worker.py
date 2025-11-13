@@ -269,7 +269,7 @@ def full_pipeline(job_details: dict):
             "Starting translation...",
             stage="translation_started",
         )
-        translations = translate_transcript(job_id, target_lang)
+        translations = translate_transcript(job_id, target_lang, src_lang=source_lang)
         # 번역 결과물(translated.json)을 S3에 업로드
         trans_result_path = paths.trg_sentence_dir / "translated.json"
         upload_to_s3(

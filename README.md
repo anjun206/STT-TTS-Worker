@@ -46,12 +46,12 @@ docker build -f app/Dockerfile --target stt-whisperx ./app
 data/
 ├── inputs/<job_id>/source.mp4
 ├── outputs/<job_id>/
-│   ├── text/ (src_transcript.comp.json.gz, trg_translated.json)
+│   ├── text/ (src_transcript.comp.json, trg_translated.json)
 │   └── vid/ (dubbed_audio.wav, dubbed_video.mp4)
 └── interim/<job_id>/
     └── text/
         ├── src/
-        │   └── sentence/transcript.comp.json.gz
+        │   └── sentence/transcript.comp.json
         ├── trg/
         │   └── sentence/translated.json
         └── vid/
@@ -64,7 +64,7 @@ data/
 
 ### Compact transcript schema
 
-- STT 단계는 세그먼트/단어 메타데이터를 `transcript.comp.json.gz` 하나에 압축 저장합니다. JSON 구조는 다음과 같습니다.
+- STT 단계는 세그먼트/단어 메타데이터를 `transcript.comp.json` 하나에 저장합니다. JSON 구조는 다음과 같습니다.
   ```json
   {
     "v": 1,
@@ -97,7 +97,7 @@ data/
 - **인덱스 우선 구조**: 화자/어휘/단어는 숫자 인덱스로 참조하여 문자열을 재사용합니다. 필요할 때만 `segment_{idx}` 같은 사람이 읽을 수 있는 ID를 생성하세요.
 - **상대 시간 표현**: 단어 수준 타임스탬프는 세그먼트 시작으로부터의 오프셋만 저장하여 절대시간 중복을 제거합니다. 세그먼트에는 시작·끝(ms)만 남기고 duration은 파생 값입니다.
 - **정규화된 점수**: WhisperX `score`(0~1 float)를 0~255 양자화 값으로 저장합니다. 이 값은 신뢰도 heatmap 등에 직접 사용할 수 있고 필요한 경우 다시 0~1 범위로 복원하면 됩니다.
-- **단일 소스**: `transcript.comp.json.gz`가 모든 언어/자막/단어 정렬의 기준입니다. 파생 산출물(`translated.json`, `segments.json` 등)은 compact 파일의 `seg_idx`나 `segment_id`만 참조하면 됩니다.
+- **단일 소스**: `transcript.comp.json`가 모든 언어/자막/단어 정렬의 기준입니다. 파생 산출물(`translated.json`, `segments.json` 등)은 compact 파일의 `seg_idx`나 `segment_id`만 참조하면 됩니다.
 
 ## 모델 다운로드
 

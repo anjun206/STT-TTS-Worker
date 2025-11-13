@@ -55,7 +55,7 @@ except Exception as exc:  # noqa: F841
     COSYVOICE_AVAILABLE = False
 
 
-PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "large-v3")
+PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "medium")
 DEFAULT_TTS_DEVICE = (
     os.getenv("TTS_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 ).lower()
@@ -99,7 +99,7 @@ def _get_cosyvoice2():
 
 @lru_cache(maxsize=1)
 def _get_prompt_stt_model():
-    """Load the fast-whisper model (large-v3 by default) for prompt extraction."""
+    """Load the fast-whisper model (medium by default) for prompt extraction."""
     from faster_whisper import WhisperModel
 
     device = PROMPT_STT_DEVICE if torch.cuda.is_available() else "cpu"
@@ -282,7 +282,6 @@ def _resolve_prompt_text(
     prompt = prompt.strip()
     if prompt:
         return prompt
-
     prompt = _transcribe_prompt_text(sample_path)
     if prompt:
         return prompt
@@ -407,8 +406,14 @@ def generate_tts(
         effective_sample = _select_voice_sample(
             seg_payload, speaker_refs, paths, normalized_user_sample
         )
+        
+        # voice_sample_path가 제공된 경우에만 prompt_text_override를 사용
+        final_prompt_text_override = None
+        if voice_sample_path is not None:
+            final_prompt_text_override = prompt_text_override
+
         prompt_text = _resolve_prompt_text(
-            seg_payload, effective_sample, prompt_text_override
+            seg_payload, effective_sample, final_prompt_text_override
         )
         _synthesize_with_cosyvoice2(
             text=text,

@@ -50,6 +50,65 @@ def _whisperx_download_root(subdir: str) -> str:
     return str(path)
 
 
+def _normalize_lang_code(value: str | None) -> str | None:
+    """Normalize various language inputs to 2-letter ISO codes used by Whisper/WhisperX.
+
+    Accepts values like 'ko', 'ko-KR', 'KO_kr', or common names like 'korean'.
+    Returns a lowercased 2-letter code, or None if cannot confidently map.
+    """
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if not v or v == "auto" or v == "none" or v == "null":
+        return None
+    v = v.replace("_", "-")
+    # locale -> base
+    if "-" in v:
+        v = v.split("-", 1)[0]
+    # common aliases
+    alias = {
+        "kr": "ko",
+        "jp": "ja",
+        "cn": "zh",
+        "tw": "zh",
+        "ua": "uk",
+        "he": "he",  # keep as-is for clarity
+    }
+    names = {
+        "english": "en",
+        "korean": "ko",
+        "japanese": "ja",
+        "chinese": "zh",
+        "mandarin": "zh",
+        "cantonese": "zh",
+        "german": "de",
+        "french": "fr",
+        "spanish": "es",
+        "portuguese": "pt",
+        "brazilian": "pt",
+        "russian": "ru",
+        "arabic": "ar",
+        "hindi": "hi",
+        "vietnamese": "vi",
+        "indonesian": "id",
+        "thai": "th",
+        "turkish": "tr",
+        "italian": "it",
+        "polish": "pl",
+        "ukrainian": "uk",
+        "dutch": "nl",
+        "hebrew": "he",
+    }
+    if v in names:
+        return names[v]
+    if v in alias:
+        return alias[v]
+    # assume 2-letter ISO code
+    if len(v) == 2 and v.isalpha():
+        return v
+    return None
+
+
 def run_asr(
     job_id: str,
     source_video_path: Path | str | None = None,
@@ -63,11 +122,10 @@ def run_asr(
         source_lang: 백엔드에서 지정한 원본 언어 코드(예: 'ko', 'en').
             지정되면 WhisperX가 언어를 자동으로 추론하지 않고 해당 언어를 사용합니다.
     """
-    lang_override = source_lang.strip() if isinstance(source_lang, str) else None
-    if lang_override and lang_override.lower() == "auto":
-        lang_override = None
+    lang_override = _normalize_lang_code(source_lang)
 
     paths = ensure_job_dirs(job_id)
+    logger.info("ASR lang preference: %s", lang_override or "auto")
     hf_token = (
         os.getenv("HF_TOKEN")
         or os.getenv("HUGGINGFACE_TOKEN")
@@ -108,13 +166,38 @@ def run_asr(
 
     # 2. WhisperX 모델을 불러와 전사 수행
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("Loading WhisperX ASR model (device=%s)", device)
-    model = whisperx.load_model(
-        "large-v3",
-        device=device,
-        compute_type="float16",  # GPU에서 성능·정확도 균형이 가장 좋음
-        download_root=_whisperx_download_root("asr"),
+    # CPU에서 float16은 지원되지 않아 CTranslate2가 하위 레벨에서 예외를 내며
+    # basic_string::_S_construct null not valid 같은 오류를 유발할 수 있습니다.
+    default_compute_type = "float16" if device == "cuda" else "int8"
+    compute_type = os.getenv("WHISPERX_COMPUTE_TYPE", default_compute_type)
+    logger.info(
+        "Loading WhisperX ASR model (device=%s, compute_type=%s)",
+        device,
+        compute_type,
     )
+    try:
+        model = whisperx.load_model(
+            "medium",
+            device=device,
+            compute_type=compute_type,
+            download_root=_whisperx_download_root("asr"),
+        )
+    except Exception as load_exc:
+        # compute_type 호환성 문제 등에 대비한 안전 폴백
+        # GPU에서도 float32는 보편적으로 지원되므로 안전한 선택입니다.
+        fallback_compute = "float32"
+        logger.warning(
+            "ASR model load failed (compute_type=%s): %s. Retrying with %s",
+            compute_type,
+            load_exc,
+            fallback_compute,
+        )
+        model = whisperx.load_model(
+            "medium",
+            device=device,
+            compute_type=fallback_compute,
+            download_root=_whisperx_download_root("asr"),
+        )
 
     # 3. 단어 정렬 전 단계: 오디오 전사 후 구간 정보 확보
     audio = whisperx.load_audio(str(vocals_audio_path))
@@ -122,13 +205,23 @@ def run_asr(
     transcribe_kwargs = {}
     if lang_override:
         transcribe_kwargs["language"] = lang_override
-    result = model.transcribe(audio, **transcribe_kwargs)
+    try:
+        result = model.transcribe(audio, **transcribe_kwargs)
+    except Exception as transcribe_exc:
+        # 언어 코드로 실패하면 자동 감지로 재시도
+        logger.warning(
+            "Transcribe failed with explicit language=%s, retrying with auto: %s",
+            lang_override,
+            transcribe_exc,
+        )
+        result = model.transcribe(audio)
+        lang_override = None  # fall back to auto thereafter
     if lang_override:
         result["language"] = lang_override
     segments = result["segments"]  # 텍스트와 대략적인 타임스탬프 포함
 
     # 4. 정밀한 타이밍을 위한 정렬 모델 로드
-    language_code = result.get("language")
+    language_code = _normalize_lang_code(result.get("language")) or lang_override
     logger.info("Loading alignment model for language=%s", language_code)
     align_kwargs = {
         "language_code": language_code,
@@ -136,23 +229,31 @@ def run_asr(
     }
     align_root = _whisperx_download_root("align")
     try:
-        align_model, metadata = whisperx.load_align_model(
-            download_root=align_root, **align_kwargs
+        try:
+            align_model, metadata = whisperx.load_align_model(
+                download_root=align_root, **align_kwargs
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument 'download_root'" in str(exc):
+                align_model, metadata = whisperx.load_align_model(**align_kwargs)
+            else:
+                raise
+        result_aligned = whisperx.align(
+            segments,
+            align_model,
+            metadata,
+            audio,
+            device=device,
+            return_char_alignments=False,
         )
-    except TypeError as exc:
-        if "unexpected keyword argument 'download_root'" in str(exc):
-            align_model, metadata = whisperx.load_align_model(**align_kwargs)
-        else:
-            raise
-    result_aligned = whisperx.align(
-        segments,
-        align_model,
-        metadata,
-        audio,
-        device=device,
-        return_char_alignments=False,
-    )
-    segments = result_aligned["segments"]  # 단어 단위 타임스탬프가 포함된 구간
+        segments = result_aligned["segments"]  # 단어 단위 타임스탬프가 포함된 구간
+    except Exception as align_exc:
+        logger.warning(
+            "Alignment skipped due to error (language=%s): %s",
+            language_code,
+            align_exc,
+        )
+        # Keep coarse segments if alignment fails
 
     # 5. pyannote 기반 화자 분리 (모델 접근을 위해 HF 토큰 필요)
     if hf_token:

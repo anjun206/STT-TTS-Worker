@@ -6,7 +6,7 @@
 
 - `inputs/<job_id>/source.mp4` – `/asr` 업로드를 통해 유입된 원본 영상.
 - `interim/<job_id>` – 모든 중간 산출물이 쌓이는 워크트리.
-  - `text/src/sentence` – WhisperX compact transcript (`transcript.comp.json.gz`).
+  - `text/src/sentence` – WhisperX compact transcript (`transcript.comp.json`).
   - `text/trg/sentence` – 번역 결과(`translated.json`).
   - `text/vid/tts` – TTS 원본 wav 및 구간별 메타데이터.
 - `outputs/<job_id>` – 사용자에게 제공하는 결과 복사본(`text/`, `vid/`).
@@ -17,8 +17,8 @@
 
 ### 산출물
 
-- `interim/<job_id>/text/src/sentence/transcript.comp.json.gz`
-- `outputs/<job_id>/text/src_transcript.comp.json.gz` (다운로드용 복사본)
+- `interim/<job_id>/text/src/sentence/transcript.comp.json`
+- `outputs/<job_id>/text/src_transcript.comp.json` (다운로드용 복사본)
 
 ### Compact Transcript 스키마
 

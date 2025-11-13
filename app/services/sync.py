@@ -1,13 +1,13 @@
 # sync.py
 from __future__ import annotations
-
 import json
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Dict, List
 
+import pyrubberband as rb
+import soundfile as sf
 from pydub import AudioSegment
 
 from configs import get_job_paths
@@ -19,6 +19,7 @@ from services.transcript_store import (
 
 MAX_SLOW_RATIO = float(os.getenv("SYNC_MAX_SLOW_RATIO", "1.1"))
 
+
 def _resolve_audio_path(path_str: str, fallback_dir: Path) -> Path:
     path = Path(path_str)
     if path.is_file():
@@ -29,25 +30,22 @@ def _resolve_audio_path(path_str: str, fallback_dir: Path) -> Path:
     raise FileNotFoundError(f"TTS 오디오 파일을 찾을 수 없습니다: {path_str}")
 
 
-def _time_stretch(input_path: Path, ratio: float) -> AudioSegment:
-    """ratio>1이면 길이를 늘리고, ratio<1이면 줄임."""
-    if ratio <= 0:
-        raise ValueError("시간 비율(ratio)은 0보다 커야 합니다.")
-    if abs(ratio - 1.0) < 0.01:
+def _time_stretch(input_path: Path, rate: float) -> AudioSegment:
+    """pyrubberband를 사용해 고품질로 시간 조절. rate>1이면 빨라져 길이가 줄고, rate<1이면 느려져 길이가 늘어납니다."""
+    if rate <= 0:
+        raise ValueError("재생 속도(rate)는 0보다 커야 합니다.")
+    if abs(rate - 1.0) < 0.01:
         return AudioSegment.from_file(str(input_path))
-    tempo_factor = 1.0 / ratio
+    y, sr = sf.read(str(input_path))
+    # pyrubberband의 time_stretch는 길이 배율이 아닌 재생 속도를 인자로 받습니다.
+    stretched_y = rb.time_stretch(y, sr, rate)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         temp_output = Path(tmp.name)
+
     try:
-        cmd = [
-            "sox",
-            str(input_path),
-            str(temp_output),
-            "tempo",
-            f"{tempo_factor:.6f}",
-        ]
-        subprocess.run(cmd, check=True, timeout=600)  # 10분 타임아웃
+        sf.write(str(temp_output), stretched_y, sr)
         return AudioSegment.from_wav(str(temp_output))
+
     finally:
         if temp_output.exists():
             temp_output.unlink()
@@ -63,15 +61,26 @@ def _sync_single_segment(
     if current_ms <= 0:
         raise RuntimeError(f"빈 오디오 파일입니다: {audio_path}")
 
-    ratio = target_ms / current_ms
-    if ratio <= 0:
+    desired_ratio = target_ms / current_ms
+    if desired_ratio <= 0:
         raise RuntimeError("목표 길이가 잘못되었습니다.")
-
-    ratio_to_apply = ratio if ratio <= 1.0 else min(ratio, allow_ratio)
-    stretched = _time_stretch(audio_path, ratio_to_apply)
+    # 길이 배율(ratio)과 pyrubberband의 재생 속도(rate) 방향이 반대이므로
+    # ratio를 clamp한 뒤 역수를 전달한다.
+    hit_slow_cap = False
+    ratio_to_apply = desired_ratio
+    if desired_ratio > 1.0:
+        if desired_ratio > allow_ratio:
+            ratio_to_apply = allow_ratio
+            hit_slow_cap = True
+    rate = 1.0 / ratio_to_apply
+    stretched = _time_stretch(audio_path, rate)
     if len(stretched) <= 0:
         raise RuntimeError("시간 조정 결과가 비정상입니다.")
-    return stretched, ratio_to_apply, 0, current_ms
+    padding_ms = 0
+    if hit_slow_cap and len(stretched) < target_ms:
+        padding_ms = target_ms - len(stretched)
+        stretched += AudioSegment.silent(duration=padding_ms)
+    return stretched, ratio_to_apply, padding_ms, current_ms
 
 
 def sync_segments(job_id: str) -> List[Dict]:
@@ -88,7 +97,9 @@ def sync_segments(job_id: str) -> List[Dict]:
             f"원본 전사({COMPACT_ARCHIVE_NAME})를 찾을 수 없습니다."
         )
     if not tts_meta_path.is_file():
-        raise FileNotFoundError("TTS 세그먼트 메타데이터가 없습니다. /tts 단계를 먼저 실행하세요.")
+        raise FileNotFoundError(
+            "TTS 세그먼트 메타데이터가 없습니다. /tts 단계를 먼저 실행하세요."
+        )
 
     bundle = load_compact_transcript(transcript_path)
     base_segments = segment_views(bundle)
@@ -107,8 +118,7 @@ def sync_segments(job_id: str) -> List[Dict]:
             raise KeyError(f"segment_id {seg_id} 에 해당하는 원본 구간이 없습니다.")
         source_seg = src_lookup[seg_id]
         target_duration = float(
-            entry.get("target_duration")
-            or source_seg.duration_seconds
+            entry.get("target_duration") or source_seg.duration_seconds
         )
         target_ms = max(1, int(target_duration * 1000))
 
@@ -127,6 +137,7 @@ def sync_segments(job_id: str) -> List[Dict]:
         synced_metadata.append(
             {
                 "segment_id": seg_id,
+                "start": round(source_seg.start_seconds, 3),
                 "source_duration": source_duration_sec,
                 "tts_duration": orig_duration_sec,
                 "synced_duration": synced_duration_sec,

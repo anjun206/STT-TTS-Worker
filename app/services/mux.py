@@ -1,4 +1,5 @@
 # mux.py
+import json
 import os
 import subprocess
 from pydub import AudioSegment
@@ -10,45 +11,60 @@ def mux_audio_video(job_id: str, video_input_path: Path | None = None):
     """합성 음성과 배경음을 결합하고 원본 영상에 다시 입혀 최종 영상을 생성합니다."""
     paths = get_job_paths(job_id)
     background_path = paths.vid_bgm_dir / "background.wav"
-    base_tts_dir = paths.vid_tts_dir
-    synced_dir = base_tts_dir / "synced"
-    tts_dir = synced_dir if synced_dir.is_dir() else base_tts_dir
     
+    # Sync 단계의 결과물인 segments_synced.json을 우선적으로 사용
+    synced_meta_path = paths.vid_tts_dir / "synced" / "segments_synced.json"
+    tts_meta_path = paths.vid_tts_dir / "segments.json"
+
+    if synced_meta_path.is_file():
+        meta_path = synced_meta_path
+    elif tts_meta_path.is_file():
+        meta_path = tts_meta_path
+    else:
+        raise FileNotFoundError("TTS or Synced metadata file not found.")
+
     video_input = video_input_path or (paths.input_dir / "source.mp4")
     video_input = Path(video_input)
     if not video_input.is_file():
         raise RuntimeError(f"Original video file not found for muxing at {video_input}")
     if not background_path.is_file():
         raise FileNotFoundError("Background audio not found. Run Demucs stage.")
-    if not tts_dir.is_dir():
-        raise FileNotFoundError("TTS audio segments not found. Run TTS stage.")
+
+    with open(meta_path, "r", encoding="utf-8") as f:
+        segments = json.load(f)
+
+    if not segments:
+        raise ValueError("No segments found in metadata file.")
 
     # 배경 오디오 로드
     background_audio = AudioSegment.from_wav(str(background_path))
     total_duration_ms = len(background_audio)
-    # 배경음을 복제해 믹싱의 베이스로 사용
-    final_audio = background_audio[:]  # 복제본
+    # 보컬 합성 결과를 따로 쌓은 뒤 마지막에 배경과 합쳐
+    # 배경 트랙 볼륨이 자동으로 낮아지는 일을 방지한다.
+    voice_mix = AudioSegment.silent(duration=total_duration_ms)
 
-    # 합성된 음성 구간을 적절한 시작 위치에 오버레이
-    wav_files = sorted(
-        f for f in os.listdir(tts_dir) if f.lower().endswith(".wav")
-    )
-    if not wav_files:
-        raise FileNotFoundError("TTS 오디오 파일이 존재하지 않습니다.")
-    for fname in wav_files:
-        if fname.endswith(".wav"):
-            segment_audio = AudioSegment.from_wav(str(tts_dir / fname))
-            # 파일명 끝부분에 기록된 시작 시간을 파싱
-            try:
-                start_time = float(os.path.splitext(fname)[0].split("_")[-1])
-            except:
-                start_time = 0.0
-            start_ms = int(start_time * 1000)
-            # 구간이 길더라도 전체 길이를 초과하지 않도록 위치 조정
-            if start_ms < 0:
-                start_ms = 0
-            # 해당 위치에 음성 구간을 오버레이
-            final_audio = final_audio.overlay(segment_audio, position=start_ms)
+    # 메타데이터를 기반으로 음성 구간을 정확한 위치에 오버레이
+    for segment in segments:
+        audio_file_path = Path(segment["audio_file"])
+        if not audio_file_path.is_file():
+            print(f"Warning: Audio file not found, skipping: {audio_file_path}")
+            continue
+        
+        segment_audio = AudioSegment.from_wav(str(audio_file_path))
+        
+        # 메타데이터에서 정확한 시작 시간 가져오기
+        start_time = float(segment.get("start", 0.0))
+        start_ms = int(start_time * 1000)
+        
+        if start_ms < 0:
+            start_ms = 0
+            
+        # 해당 위치에 음성 구간을 오버레이 (배경은 나중에 결합)
+        voice_mix = voice_mix.overlay(segment_audio, position=start_ms)
+
+    # 배경과 음성 레이어를 마지막에 결합. gain_during_overlay=0 으로
+    # 배경이 자동으로 감쇄되지 않도록 명시한다.
+    final_audio = background_audio.overlay(voice_mix, position=0, gain_during_overlay=0)
 
     # 필요 시 패딩/트리밍으로 길이를 배경 오디오와 동일하게 맞춤
     if len(final_audio) < total_duration_ms:
