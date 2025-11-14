@@ -15,8 +15,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from app.configs.config import get_job_paths
-from app.services.transcript_store import (
+import logging
+from typing import Iterable, List, Dict, Any
+
+from configs import get_job_paths
+from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
     segment_views,

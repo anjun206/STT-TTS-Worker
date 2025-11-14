@@ -7,13 +7,22 @@ from pathlib import Path
 from typing import Any, Dict, Sequence
 
 from pydub import AudioSegment
+from pydub.silence import detect_silence
 
 from .transcript_store import SegmentView
 
 logger = logging.getLogger(__name__)
 
-# self-reference 프롬프트 오디오의 최대 길이 (15초)
+# self-reference 프롬프트 오디오 길이 제한 및 가중치 정의
+MIN_REF_DURATION_MS = 3_000
+IDEAL_REF_DURATION_MS = 6_000
 MAX_REF_DURATION_MS = 15_000
+
+CLARITY_WEIGHT = 0.7
+SILENCE_WEIGHT = 0.3
+QUALITY_WEIGHT = 0.35
+LENGTH_WEIGHT = 0.65
+MIN_CONTENT_SCORE = 0.3
 
 
 @dataclass
@@ -131,25 +140,52 @@ def deserialize_reference_mapping(
     return mapping
 
 
+def _calculate_length_score(duration_ms: int) -> float:
+    """Triangular length score with its peak at IDEAL_REF_DURATION_MS."""
+    if duration_ms < MIN_REF_DURATION_MS or duration_ms > MAX_REF_DURATION_MS:
+        return 0.0
+    if duration_ms == IDEAL_REF_DURATION_MS:
+        return 1.0
+    if duration_ms < IDEAL_REF_DURATION_MS:
+        span = IDEAL_REF_DURATION_MS - MIN_REF_DURATION_MS
+        return (duration_ms - MIN_REF_DURATION_MS) / span if span else 0.0
+    span = MAX_REF_DURATION_MS - IDEAL_REF_DURATION_MS
+    return (MAX_REF_DURATION_MS - duration_ms) / span if span else 0.0
+
+
+def _speech_density_score(audio: AudioSegment) -> float:
+    """Estimate how much of the clip contains speech vs. silence."""
+    duration_ms = len(audio)
+    if duration_ms <= 0:
+        return 0.0
+    base_db = audio.dBFS if audio.dBFS != float("-inf") else -60.0
+    silence_thresh = max(base_db - 16.0, -70.0)
+    silence_spans = detect_silence(
+        audio,
+        min_silence_len=120,
+        silence_thresh=silence_thresh,
+        seek_step=15,
+    )
+    silent_ms = sum(end - start for start, end in silence_spans)
+    speech_ratio = 1.0 - min(1.0, max(0.0, silent_ms / duration_ms))
+    return max(0.0, min(1.0, speech_ratio))
+
+
 def prepare_self_reference_samples(
     vocals_audio: AudioSegment, segments: Sequence[SegmentView], out_dir: Path
 ) -> Dict[str, SpeakerReferenceSample]:
     """
-    화자별로 STT 세그먼트 중에서:
+    화자별 self-reference 샘플을 선택한다.
 
-    1) 길이 15초 이하인 세그먼트들 중 점수가 가장 높은 것 우선 선택.
-    2) 만약 15초 이하 세그먼트가 하나도 없다면, 길이와 상관 없이
-       점수가 가장 높은 세그먼트를 선택한 뒤, 오디오를 15초로 잘라 사용.
-
-    반환: speaker -> SpeakerReferenceSample
+    - 3~15초 범위 밖의 세그먼트는 제외한다.
+    - 길이 6초에서 최고점을 갖는 삼각형 길이 점수를 계산한다.
+    - 발음 명확도(=WhisperX score) 70%와 무음 비율(30%)을 결합해 컨텐츠 점수를 만든다.
+    - 컨텐츠:길이 = 35%:65% 가중합으로 최종 점수를 만든다.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # speaker 별로:
-    # - best_short: duration <= 15초 중 최고 점수
-    # - best_any  : 전체 세그먼트 중 최고 점수 (fallback용)
-    best_short: dict[str, tuple[SegmentView, float]] = {}
-    best_any: dict[str, tuple[SegmentView, float]] = {}
+    total_length = len(vocals_audio)
+    best_candidates: Dict[str, dict[str, Any]] = {}
 
     for seg in segments:
         speaker = getattr(seg, "speaker", None)
@@ -157,47 +193,58 @@ def prepare_self_reference_samples(
         if not speaker or not text:
             continue
 
-        duration_ms = getattr(seg, "duration_ms", 0) or 0
-        if duration_ms <= 0:
+        seg_start = getattr(seg, "start_ms", 0) or 0
+        seg_end = getattr(seg, "end_ms", seg_start)
+        start_ms = max(0, min(seg_start, total_length))
+        end_ms = max(start_ms, min(seg_end, total_length))
+        duration_ms = end_ms - start_ms
+
+        if (
+            duration_ms < MIN_REF_DURATION_MS
+            or duration_ms > MAX_REF_DURATION_MS
+            or duration_ms <= 0
+        ):
             continue
 
-        score_val = getattr(seg, "score", None)
+        # pydub 슬라이스는 끝점이 전체 길이를 넘어가면 자동으로 자르므로 재확인
+        sample_audio = vocals_audio[start_ms:end_ms]
+        if len(sample_audio) < MIN_REF_DURATION_MS:
+            continue
+
+        clarity_val = getattr(seg, "score", None)
         try:
-            score = float(score_val) if score_val is not None else 0.0
+            clarity_score = max(
+                0.0,
+                min(1.0, float(clarity_val)),
+            )
         except (TypeError, ValueError):
-            score = 0.0
+            clarity_score = 0.0
 
-        # 전체 최고 세그먼트 갱신
-        cur_any = best_any.get(speaker)
-        if cur_any is None or score > cur_any[1]:
-            best_any[speaker] = (seg, score)
+        speech_density = _speech_density_score(sample_audio)
+        content_score = CLARITY_WEIGHT * clarity_score + SILENCE_WEIGHT * speech_density
+        length_score = _calculate_length_score(duration_ms)
+        final_score = QUALITY_WEIGHT * content_score + LENGTH_WEIGHT * length_score
 
-        # 15초 이하 세그먼트 중 최고 세그먼트 갱신
-        if duration_ms <= MAX_REF_DURATION_MS:
-            cur_short = best_short.get(speaker)
-            if cur_short is None or score > cur_short[1]:
-                best_short[speaker] = (seg, score)
+        # 컨텐츠 품질이 너무 낮으면 스킵
+        if content_score < MIN_CONTENT_SCORE:
+            continue
+
+        current = best_candidates.get(speaker)
+        if current is None or final_score > current["score"]:
+            best_candidates[speaker] = {
+                "segment": seg,
+                "score": final_score,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+            }
 
     references: Dict[str, SpeakerReferenceSample] = {}
-    total_length = len(vocals_audio)
 
-    # speaker 별로 최종 세그먼트 선택
-    for speaker, (fallback_seg, fallback_score) in best_any.items():
-        short_entry = best_short.get(speaker)
-        if short_entry is not None:
-            seg, score = short_entry
-        else:
-            seg, score = fallback_seg, fallback_score
-
-        # 세그먼트 구간 → 오디오 인덱스
-        start_ms = max(0, min(seg.start_ms, total_length))
-        end_ms = min(seg.end_ms, total_length)
-        if end_ms <= start_ms:
-            continue
-
-        # 오디오 길이를 최대 15초로 제한
-        if end_ms - start_ms > MAX_REF_DURATION_MS:
-            end_ms = min(start_ms + MAX_REF_DURATION_MS, total_length)
+    for speaker, candidate in best_candidates.items():
+        seg: SegmentView = candidate["segment"]
+        score = candidate["score"]
+        start_ms = candidate["start_ms"]
+        end_ms = candidate["end_ms"]
 
         sample_audio = vocals_audio[start_ms:end_ms]
         if len(sample_audio) == 0:
@@ -216,10 +263,10 @@ def prepare_self_reference_samples(
             text=seg.text.strip(),
             segment_idx=seg.idx,
             segment_id=seg.segment_id(),
-            start_ms=seg.start_ms,
-            end_ms=seg.end_ms,
+            start_ms=start_ms,
+            end_ms=end_ms,
             audio_duration_ms=len(final_audio),
-            score=seg.score,
+            score=round(score, 4),
         )
 
     logger.info(

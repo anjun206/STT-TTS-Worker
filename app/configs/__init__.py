@@ -32,9 +32,7 @@ INPUTS_DIR = _env_path("INPUTS_DIR", DATA_DIR / "inputs")
 INTERIM_DIR = _env_path("INTERIM_DIR", DATA_DIR / "interim")
 OUTPUTS_DIR = _env_path("OUTPUTS_DIR", DATA_DIR / "outputs")
 MODELS_DIR = _env_path("MODELS_DIR", "/models")
-WHISPERX_CACHE_DIR = _env_path(
-    "WHISPERX_CACHE_DIR", MODELS_DIR / ".cache" / "whisperx"
-)
+WHISPERX_CACHE_DIR = _env_path("WHISPERX_CACHE_DIR", MODELS_DIR / ".cache" / "whisperx")
 
 
 @dataclass(frozen=True)

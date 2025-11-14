@@ -34,8 +34,13 @@ try:
     from whisperx.diarize import DiarizationPipeline
 except ImportError:  # WhisperX<3.7 fallback
     from whisperx import DiarizationPipeline
-from app.configs.config import WHISPERX_CACHE_DIR, ensure_job_dirs
-from app.services.transcript_store import (
+try:
+    from app.configs import WHISPERX_CACHE_DIR, ensure_job_dirs
+except ModuleNotFoundError as exc:  # allow running when /app is the root
+    if exc.name != "app":
+        raise
+    from configs import WHISPERX_CACHE_DIR, ensure_job_dirs
+from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     build_compact_transcript,
     save_compact_transcript,
@@ -46,7 +51,7 @@ from services.self_reference import (  # NEW
     prepare_self_reference_samples,
     serialize_reference_mapping,
 )
-from app.services.demucs_split import split_vocals
+from services.demucs_split import split_vocals
 
 logger = logging.getLogger(__name__)
 

@@ -3,15 +3,21 @@ import json
 import os
 import subprocess
 from pydub import AudioSegment
-from app.configs.config import get_job_paths
 from pathlib import Path
+
+try:
+    from app.configs import get_job_paths
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs import get_job_paths
 
 
 def mux_audio_video(job_id: str, video_input_path: Path | None = None):
     """합성 음성과 배경음을 결합하고 원본 영상에 다시 입혀 최종 영상을 생성합니다."""
     paths = get_job_paths(job_id)
     background_path = paths.vid_bgm_dir / "background.wav"
-    
+
     # Sync 단계의 결과물인 segments_synced.json을 우선적으로 사용
     synced_meta_path = paths.vid_tts_dir / "synced" / "segments_synced.json"
     tts_meta_path = paths.vid_tts_dir / "segments.json"
@@ -49,16 +55,16 @@ def mux_audio_video(job_id: str, video_input_path: Path | None = None):
         if not audio_file_path.is_file():
             print(f"Warning: Audio file not found, skipping: {audio_file_path}")
             continue
-        
+
         segment_audio = AudioSegment.from_wav(str(audio_file_path))
-        
+
         # 메타데이터에서 정확한 시작 시간 가져오기
         start_time = float(segment.get("start", 0.0))
         start_ms = int(start_time * 1000)
-        
+
         if start_ms < 0:
             start_ms = 0
-            
+
         # 해당 위치에 음성 구간을 오버레이 (배경은 나중에 결합)
         voice_mix = voice_mix.overlay(segment_audio, position=start_ms)
 

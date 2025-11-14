@@ -7,19 +7,36 @@ from typing import Any, Dict, Optional
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.configs.config import ensure_job_dirs
-from app.configs.env import (
-    AWS_S3_BUCKET,
-    DEFAULT_SOURCE_LANG,
-    DEFAULT_TARGET_LANG,
-    LOG_LEVEL,
-)
-from app.configs.utils import JobProcessingError, post_status
-from app.services.mux import mux_audio_video
-from app.services.stt import run_asr
-from app.services.sync import sync_segments
-from app.services.translate import translate_transcript
-from app.services.tts import generate_tts
+try:
+    from app.configs import ensure_job_dirs
+    from app.configs.env import (
+        AWS_S3_BUCKET,
+        DEFAULT_SOURCE_LANG,
+        DEFAULT_TARGET_LANG,
+        LOG_LEVEL,
+    )
+    from app.configs.utils import JobProcessingError, post_status
+    from app.services.mux import mux_audio_video
+    from app.services.stt import run_asr
+    from app.services.sync import sync_segments
+    from app.services.translate import translate_transcript
+    from app.services.tts import generate_tts
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs import ensure_job_dirs
+    from configs.env import (
+        AWS_S3_BUCKET,
+        DEFAULT_SOURCE_LANG,
+        DEFAULT_TARGET_LANG,
+        LOG_LEVEL,
+    )
+    from configs.utils import JobProcessingError, post_status
+    from services.mux import mux_audio_video
+    from services.stt import run_asr
+    from services.sync import sync_segments
+    from services.translate import translate_transcript
+    from services.tts import generate_tts
 
 
 logger = logging.getLogger(__name__)

@@ -20,8 +20,13 @@ from services.self_reference import (
     deserialize_reference_mapping,
 )
 
-from app.configs.config import get_job_paths
-from app.services.transcript_store import (
+try:
+    from app.configs import get_job_paths
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs import get_job_paths
+from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
     segment_views,
