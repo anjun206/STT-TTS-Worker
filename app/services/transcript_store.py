@@ -80,6 +80,7 @@ class SegmentView:
     word_count: int
     overlap: bool
     orig: int | None
+    score_q: int | None = None
 
     @property
     def duration_ms(self) -> int:
@@ -96,6 +97,12 @@ class SegmentView:
     @property
     def duration_seconds(self) -> float:
         return self.duration_ms / 1000.0
+
+    @property
+    def score(self) -> float | None:
+        if self.score_q is None:
+            return None
+        return round(self.score_q / 255.0, 4)
 
     def segment_id(self) -> str:
         return f"segment_{self.idx:04d}"
@@ -119,6 +126,7 @@ class SegmentView:
             "word_count": self.word_count,
             "overlap": self.overlap,
             "orig_segment_id": self.orig,
+            "score": self.score,
         }
 
 
@@ -144,6 +152,7 @@ def build_compact_transcript(
         speaker_idx = _ensure_speaker_index(speaker_name, speaker_index, speakers)
 
         w_start = len(compact_words)
+        word_scores: list[float] = []
         words = seg.get("words") or []
         for word in words:
             token = (word.get("word") or "").strip()
@@ -156,11 +165,25 @@ def build_compact_transcript(
             offset_start = max(0, w_abs_start - start_ms)
             offset_end = max(offset_start, w_abs_end - start_ms)
             vocab_idx = _ensure_vocab_index(token, vocab_index, vocab)
-            score_q = _quantize_score(word.get("score"))
+            score_val = word.get("score")
+            if score_val is not None:
+                try:
+                    word_scores.append(float(score_val))
+                except (TypeError, ValueError):
+                    pass
+            score_q = _quantize_score(score_val)
             compact_words.append(
                 [idx, offset_start, offset_end, vocab_idx, score_q]
             )
         w_count = len(compact_words) - w_start
+        segment_score_q: int | None = None
+        if word_scores:
+            avg_score = sum(word_scores) / len(word_scores)
+            segment_score_q = _quantize_score(avg_score)
+        else:
+            fallback_score = seg.get("score")
+            if fallback_score is not None:
+                segment_score_q = _quantize_score(fallback_score)
 
         next_start_ms = (
             _to_ms(aligned_segments[idx + 1].get("start"))
@@ -176,18 +199,20 @@ def build_compact_transcript(
         overlap = bool(prev_end_ms is not None and start_ms < prev_end_ms)
         prev_end_ms = end_ms if prev_end_ms is None else max(prev_end_ms, end_ms)
 
-        compact_segments.append(
-            {
-                "s": start_ms,
-                "e": end_ms,
-                "sp": speaker_idx,
-                "txt": text,
-                "gap": [gap_after, gap_after_vad],
-                "w_off": [w_start, w_count],
-                "o": seg.get("id", idx),
-                "ov": overlap,
-            }
-        )
+        segment_entry = {
+            "s": start_ms,
+            "e": end_ms,
+            "sp": speaker_idx,
+            "txt": text,
+            "gap": [gap_after, gap_after_vad],
+            "w_off": [w_start, w_count],
+            "o": seg.get("id", idx),
+            "ov": overlap,
+        }
+        if segment_score_q is not None:
+            segment_entry["sc"] = segment_score_q
+
+        compact_segments.append(segment_entry)
 
     return {
         "v": SCHEMA_VERSION,
@@ -252,6 +277,10 @@ def segment_views(bundle: dict) -> List[SegmentView]:
         )
         gap = seg.get("gap") or [None, None]
         w_off = seg.get("w_off") or [0, 0]
+        score_q = seg.get("sc")
+        score_val = None
+        if isinstance(score_q, int):
+            score_val = max(0, min(255, score_q))
         views.append(
             SegmentView(
                 idx=idx,
@@ -265,6 +294,7 @@ def segment_views(bundle: dict) -> List[SegmentView]:
                 word_count=w_off[1],
                 overlap=bool(seg.get("ov")),
                 orig=seg.get("o"),
+                score_q=score_val,
             )
         )
     return views

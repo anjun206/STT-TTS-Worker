@@ -103,7 +103,7 @@ class GeminiTranslator:
             )
 
         # 모델/리전
-        self.model_name = _env_str("VERTEX_GEMINI_MODEL", "gemini-2.5-flash")
+        self.model_name = _env_str("VERTEX_GEMINI_MODEL", "gemini-2.5-pro")
         self.location = _env_str("VERTEX_LOCATION", "us-central1")
         self.project_id = _env_str("VERTEX_PROJECT_ID")
 
@@ -165,7 +165,8 @@ class GeminiTranslator:
             "You are a professional subtitle translator.\n"
             "- Translate with dubbing in mind.\n"
             "- Idioms can be paraphrased.\n"
-            "- Translate short things briefly.\n"
+            "- translate short texts as briefly as possible.\n"
+            "- For numbers, translate them into their context-sensitive pronunciation.\n"
             "- Translate each item from source language to the target language.\n"
             "- Do NOT merge or split items.\n"
             "- Do NOT add explanations, numbering, or any extra text.\n"

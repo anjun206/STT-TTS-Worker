@@ -134,19 +134,36 @@ def sync_segments(job_id: str) -> List[Dict]:
         source_duration_sec = round(target_ms / 1000, 3)
         orig_duration_sec = round(original_ms / 1000, 3)
         synced_duration_sec = round(len(synced_audio) / 1000, 3)
-        synced_metadata.append(
-            {
-                "segment_id": seg_id,
-                "start": round(source_seg.start_seconds, 3),
-                "source_duration": source_duration_sec,
-                "tts_duration": orig_duration_sec,
-                "synced_duration": synced_duration_sec,
-                "ratio_target": round(target_ms / original_ms, 4),
-                "ratio_applied": round(ratio_applied, 4),
-                "padding_ms": padding_ms,
-                "audio_file": str(output_path),
-            }
-        )
+        synced_entry = {
+            "segment_id": seg_id,
+            "start": round(source_seg.start_seconds, 3),
+            "source_duration": source_duration_sec,
+            "tts_duration": orig_duration_sec,
+            "synced_duration": synced_duration_sec,
+            "ratio_target": round(target_ms / original_ms, 4),
+            "ratio_applied": round(ratio_applied, 4),
+            "padding_ms": padding_ms,
+            "audio_file": str(output_path),
+        }
+        # tts_segments에서 source_text와 기타 필드 보존
+        if "source_text" in entry:
+            synced_entry["source_text"] = entry["source_text"]
+        elif source_seg.text:
+            synced_entry["source_text"] = source_seg.text
+
+        # 기타 필드들도 보존 (speaker, seg_idx, start, end, prompt_text 등)
+        for key in [
+            "speaker",
+            "seg_idx",
+            "start",
+            "end",
+            "prompt_text",
+            "voice_sample",
+        ]:
+            if key in entry:
+                synced_entry[key] = entry[key]
+
+        synced_metadata.append(synced_entry)
 
     meta_path = synced_dir / "segments_synced.json"
     with open(meta_path, "w", encoding="utf-8") as f:

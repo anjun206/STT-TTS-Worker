@@ -38,6 +38,7 @@ app = FastAPI(
 # 기본 작업 폴더가 없으면 생성
 ensure_data_dirs()
 
+
 @app.post("/asr", response_model=ASRResponse)
 async def asr_endpoint(
     job_id: str = Form(None),
@@ -100,7 +101,7 @@ async def translate_endpoint(request: TranslateRequest):
 async def tts_endpoint(
     job_id: str = Form(...),
     target_lang: str = Form(...),
-    voice_sample: UploadFile | None = File(None),
+    voice_sample: UploadFile | str | None = File(None),
     prompt_text: str | None = Form(None),
 ):
     """
@@ -108,9 +109,15 @@ async def tts_endpoint(
     """
     paths = ensure_job_dirs(job_id)
     user_voice_sample_path: Path | None = None
+    # multipart 필드가 빈 문자열로 들어오면 str("")이 되므로 None 취급
+    if isinstance(voice_sample, str):
+        voice_upload: UploadFile | None = None
+    else:
+        voice_upload = voice_sample
+
     # voice_sample이 실제 파일인지 확인 (빈 문자열이 아닌지)
-    if voice_sample and voice_sample.filename:
-        suffix = Path(voice_sample.filename).suffix.lower()
+    if voice_upload and voice_upload.filename:
+        suffix = Path(voice_upload.filename).suffix.lower()
         if suffix != ".wav":
             return JSONResponse(
                 status_code=400,
@@ -119,7 +126,7 @@ async def tts_endpoint(
         custom_ref_dir = paths.interim_dir / "tts_custom_refs"
         custom_ref_dir.mkdir(parents=True, exist_ok=True)
         user_voice_sample_path = custom_ref_dir / f"user_voice_sample{suffix}"
-        data = await voice_sample.read()
+        data = await voice_upload.read()
         with open(user_voice_sample_path, "wb") as f:
             f.write(data)
     else:
@@ -148,10 +155,17 @@ async def tts_endpoint(
     return {"job_id": job_id, "audio_segments": segments}
 
 
+from fastapi import UploadFile, File, Form
+from pathlib import Path
+import uuid
+import logging
+
+
 @app.post("/pipeline")
 async def pipeline_endpoint(
     file: UploadFile = File(...),
-    voice_sample: UploadFile | None = File(None),
+    # ⬇️ 여기: str도 허용하도록 수정
+    voice_sample: UploadFile | str | None = File(None),
     job_id: str | None = Form(None),
     target_lang: str = Form(...),
     src_lang: str | None = Form(None),
@@ -165,6 +179,7 @@ async def pipeline_endpoint(
             status_code=400,
             content={"error": "Input video file is required."},
         )
+
     job_id = job_id or str(uuid.uuid4())
     paths = ensure_job_dirs(job_id)
 
@@ -177,20 +192,31 @@ async def pipeline_endpoint(
     with open(source_video_path, "wb") as f:
         f.write(media_bytes)
 
+    # === 여기부터 voice_sample 정규화 ===
     user_voice_sample_path: Path | None = None
-    if voice_sample and voice_sample.filename:
-        sample_suffix = Path(voice_sample.filename).suffix.lower()
-        if sample_suffix != ".wav":
+
+    # 1) curl -F 'voice_sample=' 같이 들어오면: str("") 로 들어옴 → 그냥 None 취급
+    if isinstance(voice_sample, str):
+        voice_upload: UploadFile | None = None
+    else:
+        voice_upload = voice_sample
+
+    # 2) 진짜 업로드된 파일인 경우에만 저장
+    if voice_upload and voice_upload.filename:
+        suffix = Path(voice_upload.filename).suffix.lower()
+        if suffix != ".wav":
             return JSONResponse(
                 status_code=400,
                 content={"error": "voice_sample must be a .wav file."},
             )
         custom_ref_dir = paths.interim_dir / "tts_custom_refs"
         custom_ref_dir.mkdir(parents=True, exist_ok=True)
-        user_voice_sample_path = custom_ref_dir / f"user_voice_sample{sample_suffix}"
-        sample_bytes = await voice_sample.read()
+        user_voice_sample_path = custom_ref_dir / f"user_voice_sample{suffix}"
+        sample_bytes = await voice_upload.read()
         with open(user_voice_sample_path, "wb") as f:
             f.write(sample_bytes)
+    else:
+        user_voice_sample_path = None
 
     prompt_text_value = prompt_text.strip() if prompt_text else None
 

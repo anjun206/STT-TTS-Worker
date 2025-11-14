@@ -5,6 +5,9 @@ import shutil
 import subprocess
 from pathlib import Path
 import torch
+import json
+
+from pydub import AudioSegment
 
 # Transformers>=4.41 expects torch.utils._pytree.register_pytree_node.
 _pytree = getattr(getattr(torch, "utils", None), "_pytree", None)
@@ -37,6 +40,11 @@ from services.transcript_store import (
     build_compact_transcript,
     save_compact_transcript,
     segment_preview,
+    segment_views,
+)
+from services.self_reference import (  # NEW
+    prepare_self_reference_samples,
+    serialize_reference_mapping,
 )
 from services.demucs_split import split_vocals
 
@@ -146,7 +154,6 @@ def run_asr(
     raw_audio_path = paths.vid_speaks_dir / "audio.wav"
 
     # 1. 영상에서 오디오 추출 (Whisper 권장 형식: 모노 16kHz)
-    # subprocess로 ffmpeg 실행 (사전 설치 필요)
     extract_cmd = [
         "ffmpeg",
         "-y",
@@ -177,7 +184,7 @@ def run_asr(
     )
     try:
         model = whisperx.load_model(
-            "medium",
+            "large-v2",
             device=device,
             compute_type=compute_type,
             download_root=_whisperx_download_root("asr"),
@@ -193,7 +200,7 @@ def run_asr(
             fallback_compute,
         )
         model = whisperx.load_model(
-            "medium",
+            "large-v2",
             device=device,
             compute_type=fallback_compute,
             download_root=_whisperx_download_root("asr"),
@@ -202,7 +209,7 @@ def run_asr(
     # 3. 단어 정렬 전 단계: 오디오 전사 후 구간 정보 확보
     audio = whisperx.load_audio(str(vocals_audio_path))
     logger.info("Running ASR transcription via WhisperX")
-    transcribe_kwargs = {}
+    transcribe_kwargs: dict = {}
     if lang_override:
         transcribe_kwargs["language"] = lang_override
     try:
@@ -219,6 +226,12 @@ def run_asr(
     if lang_override:
         result["language"] = lang_override
     segments = result["segments"]  # 텍스트와 대략적인 타임스탬프 포함
+
+    # align 성공/실패와 관계없이 사용할 기본 result_aligned (coarse segments)
+    result_aligned = {
+        "segments": segments,
+        "language": result.get("language"),
+    }
 
     # 4. 정밀한 타이밍을 위한 정렬 모델 로드
     language_code = _normalize_lang_code(result.get("language")) or lang_override
@@ -238,7 +251,7 @@ def run_asr(
                 align_model, metadata = whisperx.load_align_model(**align_kwargs)
             else:
                 raise
-        result_aligned = whisperx.align(
+        aligned = whisperx.align(
             segments,
             align_model,
             metadata,
@@ -246,6 +259,7 @@ def run_asr(
             device=device,
             return_char_alignments=False,
         )
+        result_aligned = aligned
         segments = result_aligned["segments"]  # 단어 단위 타임스탬프가 포함된 구간
     except Exception as align_exc:
         logger.warning(
@@ -253,7 +267,7 @@ def run_asr(
             language_code,
             align_exc,
         )
-        # Keep coarse segments if alignment fails
+        # result_aligned는 coarse segments 그대로 유지
 
     # 5. pyannote 기반 화자 분리 (모델 접근을 위해 HF 토큰 필요)
     if hf_token:
@@ -285,6 +299,34 @@ def run_asr(
         transcript_archive,
         paths.outputs_text_dir / f"src_{COMPACT_ARCHIVE_NAME}",
     )
+
+    # 7-1. 화자별 self-reference 샘플을 미리 생성해 둠 (TTS에서 재사용)
+    try:
+        base_segments = segment_views(bundle)
+        vocals_audio = AudioSegment.from_wav(str(vocals_audio_path))
+
+        tts_dir = paths.vid_tts_dir
+        tts_dir.mkdir(parents=True, exist_ok=True)
+
+        speaker_ref_dir = tts_dir / "self_refs"
+        speaker_refs = prepare_self_reference_samples(
+            vocals_audio, base_segments, speaker_ref_dir
+        )
+        # speaker -> self_ref wav & metadata 매핑 저장
+        mapping = serialize_reference_mapping(speaker_refs, tts_dir)
+        with open(tts_dir / "speaker_refs.json", "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+        logger.info(
+            "Saved self-reference mapping for %d speakers at %s",
+            len(mapping),
+            tts_dir / "speaker_refs.json",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to precompute self-reference samples for job %s: %s",
+            job_id,
+            exc,
+        )
 
     # 레거시 산출물 정리 (존재할 경우)
     legacy_transcript = paths.src_sentence_dir / "transcript.json"
