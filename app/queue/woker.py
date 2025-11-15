@@ -7,17 +7,30 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 
-from app.configs.env import (
-    JOB_QUEUE_URL,
-    AWS_REGION,
-    AWS_S3_BUCKET,
-    LOG_LEVEL,
-    POLL_WAIT,
-    PROFILE,
-    VISIBILITY_TIMEOUT,
-    JobProcessingError,
-    post_status,
-)
+try:
+    from app.configs.utils import JobProcessingError, post_status
+    from app.configs.env import (
+        JOB_QUEUE_URL,
+        AWS_REGION,
+        AWS_S3_BUCKET,
+        LOG_LEVEL,
+        POLL_WAIT,
+        PROFILE,
+        VISIBILITY_TIMEOUT,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs.utils import JobProcessingError, post_status
+    from configs.env import (
+        JOB_QUEUE_URL,
+        AWS_REGION,
+        AWS_S3_BUCKET,
+        LOG_LEVEL,
+        POLL_WAIT,
+        PROFILE,
+        VISIBILITY_TIMEOUT,
+    )
 from .pipeline.full_pipeline import FullPipeline
 
 logger = logging.getLogger(__name__)

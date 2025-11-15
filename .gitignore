@@ -5,3 +5,4 @@ models_cache/
 app/services/__pycache__/
 app/__pycache__/
 .venv/
+key/

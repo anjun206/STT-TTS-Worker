@@ -1,16 +1,21 @@
 # sync.py
 from __future__ import annotations
-
 import json
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Dict, List
 
+import pyrubberband as rb
+import soundfile as sf
 from pydub import AudioSegment
 
-from configs import get_job_paths
+try:
+    from app.configs import get_job_paths
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from configs import get_job_paths
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
@@ -18,7 +23,6 @@ from services.transcript_store import (
 )
 
 MAX_SLOW_RATIO = float(os.getenv("SYNC_MAX_SLOW_RATIO", "1.1"))
-LENGTH_TOLERANCE_MS = 20  # 밀리초
 
 
 def _resolve_audio_path(path_str: str, fallback_dir: Path) -> Path:
@@ -31,36 +35,25 @@ def _resolve_audio_path(path_str: str, fallback_dir: Path) -> Path:
     raise FileNotFoundError(f"TTS 오디오 파일을 찾을 수 없습니다: {path_str}")
 
 
-def _time_stretch(input_path: Path, ratio: float) -> AudioSegment:
-    """ratio>1이면 길이를 늘리고, ratio<1이면 줄임."""
-    if ratio <= 0:
-        raise ValueError("시간 비율(ratio)은 0보다 커야 합니다.")
-    if abs(ratio - 1.0) < 0.01:
+def _time_stretch(input_path: Path, rate: float) -> AudioSegment:
+    """pyrubberband를 사용해 고품질로 시간 조절. rate>1이면 빨라져 길이가 줄고, rate<1이면 느려져 길이가 늘어납니다."""
+    if rate <= 0:
+        raise ValueError("재생 속도(rate)는 0보다 커야 합니다.")
+    if abs(rate - 1.0) < 0.01:
         return AudioSegment.from_file(str(input_path))
-    tempo_factor = 1.0 / ratio
+    y, sr = sf.read(str(input_path))
+    # pyrubberband의 time_stretch는 길이 배율이 아닌 재생 속도를 인자로 받습니다.
+    stretched_y = rb.time_stretch(y, sr, rate)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         temp_output = Path(tmp.name)
+
     try:
-        cmd = [
-            "sox",
-            str(input_path),
-            str(temp_output),
-            "tempo",
-            f"{tempo_factor:.6f}",
-        ]
-        subprocess.run(cmd, check=True, timeout=600)  # 10분 타임아웃
+        sf.write(str(temp_output), stretched_y, sr)
         return AudioSegment.from_wav(str(temp_output))
+
     finally:
         if temp_output.exists():
             temp_output.unlink()
-
-
-def _apply_balanced_padding(audio: AudioSegment, padding_ms: int) -> AudioSegment:
-    if padding_ms <= 0:
-        return audio
-    lead = AudioSegment.silent(duration=padding_ms // 2)
-    tail = AudioSegment.silent(duration=padding_ms - len(lead))
-    return lead + audio + tail
 
 
 def _sync_single_segment(
@@ -73,36 +66,33 @@ def _sync_single_segment(
     if current_ms <= 0:
         raise RuntimeError(f"빈 오디오 파일입니다: {audio_path}")
 
-    ratio = target_ms / current_ms
-    if ratio <= 0:
+    desired_ratio = target_ms / current_ms
+    if desired_ratio <= 0:
         raise RuntimeError("목표 길이가 잘못되었습니다.")
-
-    ratio_to_apply = ratio
-    padding_added = 0
-    if ratio > 1.0:
-        ratio_to_apply = min(ratio, allow_ratio)
-    stretched = _time_stretch(audio_path, ratio_to_apply)
-
-    if ratio > allow_ratio and len(stretched) < target_ms:
-        padding_needed = target_ms - len(stretched)
-        stretched = _apply_balanced_padding(stretched, padding_needed)
-        padding_added = padding_needed
-
-    if len(stretched) > target_ms + LENGTH_TOLERANCE_MS:
-        stretched = stretched[:target_ms]
-    elif len(stretched) < target_ms - LENGTH_TOLERANCE_MS:
-        pad_ms = target_ms - len(stretched)
-        stretched += AudioSegment.silent(duration=pad_ms)
-        padding_added += pad_ms
-
-    return stretched, ratio_to_apply, padding_added, current_ms
+    # 길이 배율(ratio)과 pyrubberband의 재생 속도(rate) 방향이 반대이므로
+    # ratio를 clamp한 뒤 역수를 전달한다.
+    hit_slow_cap = False
+    ratio_to_apply = desired_ratio
+    if desired_ratio > 1.0:
+        if desired_ratio > allow_ratio:
+            ratio_to_apply = allow_ratio
+            hit_slow_cap = True
+    rate = 1.0 / ratio_to_apply
+    stretched = _time_stretch(audio_path, rate)
+    if len(stretched) <= 0:
+        raise RuntimeError("시간 조정 결과가 비정상입니다.")
+    padding_ms = 0
+    if hit_slow_cap and len(stretched) < target_ms:
+        padding_ms = target_ms - len(stretched)
+        stretched += AudioSegment.silent(duration=padding_ms)
+    return stretched, ratio_to_apply, padding_ms, current_ms
 
 
 def sync_segments(job_id: str) -> List[Dict]:
     """
     번역/TTS 후 구간별 오디오를 원본 화자 길이에 맞게 보정합니다.
-    - 길이가 더 길다면 배속 제한 없이 줄임
-    - 길이가 짧다면 최대 1.1배까지 실제 오디오를 스트레치하고 남는 길이는 무음으로 보충
+    - 길이가 더 길면 배속(tempo up)으로만 맞추고 자르지 않음
+    - 길이가 짧으면 최대 MAX_SLOW_RATIO까지만 감속(tempo down)하고 남은 구간은 비워둠
     """
     paths = get_job_paths(job_id)
     transcript_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
@@ -112,7 +102,9 @@ def sync_segments(job_id: str) -> List[Dict]:
             f"원본 전사({COMPACT_ARCHIVE_NAME})를 찾을 수 없습니다."
         )
     if not tts_meta_path.is_file():
-        raise FileNotFoundError("TTS 세그먼트 메타데이터가 없습니다. /tts 단계를 먼저 실행하세요.")
+        raise FileNotFoundError(
+            "TTS 세그먼트 메타데이터가 없습니다. /tts 단계를 먼저 실행하세요."
+        )
 
     bundle = load_compact_transcript(transcript_path)
     base_segments = segment_views(bundle)
@@ -131,8 +123,7 @@ def sync_segments(job_id: str) -> List[Dict]:
             raise KeyError(f"segment_id {seg_id} 에 해당하는 원본 구간이 없습니다.")
         source_seg = src_lookup[seg_id]
         target_duration = float(
-            entry.get("target_duration")
-            or source_seg.duration_seconds
+            entry.get("target_duration") or source_seg.duration_seconds
         )
         target_ms = max(1, int(target_duration * 1000))
 
@@ -148,18 +139,36 @@ def sync_segments(job_id: str) -> List[Dict]:
         source_duration_sec = round(target_ms / 1000, 3)
         orig_duration_sec = round(original_ms / 1000, 3)
         synced_duration_sec = round(len(synced_audio) / 1000, 3)
-        synced_metadata.append(
-            {
-                "segment_id": seg_id,
-                "source_duration": source_duration_sec,
-                "tts_duration": orig_duration_sec,
-                "synced_duration": synced_duration_sec,
-                "ratio_target": round(target_ms / original_ms, 4),
-                "ratio_applied": round(ratio_applied, 4),
-                "padding_ms": padding_ms,
-                "audio_file": str(output_path),
-            }
-        )
+        synced_entry = {
+            "segment_id": seg_id,
+            "start": round(source_seg.start_seconds, 3),
+            "source_duration": source_duration_sec,
+            "tts_duration": orig_duration_sec,
+            "synced_duration": synced_duration_sec,
+            "ratio_target": round(target_ms / original_ms, 4),
+            "ratio_applied": round(ratio_applied, 4),
+            "padding_ms": padding_ms,
+            "audio_file": str(output_path),
+        }
+        # tts_segments에서 source_text와 기타 필드 보존
+        if "source_text" in entry:
+            synced_entry["source_text"] = entry["source_text"]
+        elif source_seg.text:
+            synced_entry["source_text"] = source_seg.text
+
+        # 기타 필드들도 보존 (speaker, seg_idx, start, end, prompt_text 등)
+        for key in [
+            "speaker",
+            "seg_idx",
+            "start",
+            "end",
+            "prompt_text",
+            "voice_sample",
+        ]:
+            if key in entry:
+                synced_entry[key] = entry[key]
+
+        synced_metadata.append(synced_entry)
 
     meta_path = synced_dir / "segments_synced.json"
     with open(meta_path, "w", encoding="utf-8") as f:
