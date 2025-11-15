@@ -76,6 +76,7 @@ class FullPipeline:
         self.callback_url = (payload.get("callback_url") or "").strip()
         self.target_lang = (payload.get("target_lang") or DEFAULT_TARGET_LANG).strip()
         self.source_lang = (payload.get("source_lang") or DEFAULT_SOURCE_LANG).strip()
+        self.speaker_count = self._parse_speaker_count(payload.get("speaker_count"))
         self.voice_sample_key = payload.get("voice_sample_key")
         self.voice_sample_bucket = payload.get("voice_sample_bucket") or self.bucket
         self.voice_sample_path_hint = payload.get("voice_sample_path")
@@ -108,7 +109,11 @@ class FullPipeline:
             )
 
             # 2) ASR → 번역 → TTS → 싱크 순서로 미디어를 준비한다.
-            run_asr(self.job_id, source_lang=self.source_lang)
+            run_asr(
+                self.job_id,
+                source_lang=self.source_lang,
+                speaker_count=self.speaker_count,
+            )
             self._post_stage("stt_completed")
 
             self._post_stage("mt_prepare")
@@ -198,6 +203,25 @@ class FullPipeline:
         if self.project_id:
             return f"projects/{self.project_id}/{self.job_id}"
         return f"jobs/{self.job_id}"
+
+    def _parse_speaker_count(self, raw_value) -> Optional[int]:
+        if raw_value in (None, ""):
+            return None
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "speaker_count=%r 를 정수로 파싱하지 못했습니다. 자동 추정으로 진행합니다.",
+                raw_value,
+            )
+            return None
+        if parsed < 1:
+            logger.warning(
+                "speaker_count=%r 는 1 이상이어야 합니다. 자동 추정으로 진행합니다.",
+                raw_value,
+            )
+            return None
+        return parsed
 
     def _post_stage(
         self, stage: str, metadata: Optional[Dict[str, Any]] = None

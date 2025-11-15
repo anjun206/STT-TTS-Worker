@@ -11,6 +11,9 @@ SCHEMA_VERSION = 1
 # 기존 .gz 파일과의 호환을 위해 로드 시 자동 폴백을 지원합니다.
 COMPACT_ARCHIVE_NAME = "transcript.comp.json"
 
+DEFAULT_SPEAKER_NAME = "SPEAKER_00"
+UNKNOWN_SPEAKER_NAME = "unknown_speaker"
+
 
 def _to_ms(value) -> int | None:
     if value is None:
@@ -40,11 +43,15 @@ def _quantize_score(value) -> int:
 
 def _normalize_speaker(raw) -> str:
     if raw is None:
-        return "unknown_speaker"
+        return DEFAULT_SPEAKER_NAME
     if isinstance(raw, int):
         return f"SPEAKER_{raw:02d}"
     value = str(raw).strip()
-    return value or "unknown_speaker"
+    if not value:
+        return DEFAULT_SPEAKER_NAME
+    if value == UNKNOWN_SPEAKER_NAME:
+        return DEFAULT_SPEAKER_NAME
+    return value
 
 
 def _ensure_speaker_index(name: str, table: dict[str, int], ordered: list[str]) -> int:
@@ -273,8 +280,10 @@ def segment_views(bundle: dict) -> List[SegmentView]:
         speaker = (
             speakers[sp_idx]
             if isinstance(sp_idx, int) and 0 <= sp_idx < len(speakers)
-            else "unknown_speaker"
+            else UNKNOWN_SPEAKER_NAME
         )
+        if speaker == UNKNOWN_SPEAKER_NAME:
+            speaker = DEFAULT_SPEAKER_NAME
         gap = seg.get("gap") or [None, None]
         w_off = seg.get("w_off") or [0, 0]
         score_q = seg.get("sc")

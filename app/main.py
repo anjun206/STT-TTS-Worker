@@ -44,11 +44,13 @@ async def asr_endpoint(
     job_id: str = Form(None),
     file: UploadFile = File(None),
     src_lang: str | None = Form(None),
+    speaker_count: int | None = Form(None, ge=1),
 ):
     """
     새 영상을 업로드하거나 기존 job_id를 지정해 WhisperX로 음성을 추출합니다.
     - 선택적으로 `src_lang`(예: 'ko', 'en')을 지정하면 해당 언어로 고정해 인식합니다.
       지정하지 않거나 'auto'이면 WhisperX가 자동으로 언어를 추론합니다.
+    - `speaker_count`에 1 이상의 정수를 지정하면 pyannote diarization이 해당 화자 수를 기준으로 동작합니다.
     job_id와 화자 정보가 포함된 전사 구간 목록을 반환합니다.
     """
     if file:
@@ -71,7 +73,11 @@ async def asr_endpoint(
     try:
         # src_lang가 제공되면 WhisperX 자동 언어 추론을 비활성화하고 해당 언어로 고정
         # 예: 'ko', 'en', 'ja' 등 ISO 언어 코드. 'auto' 또는 빈 값이면 자동 추론 유지
-        segments = run_asr(job_id, source_lang=src_lang)
+        segments = run_asr(
+            job_id,
+            source_lang=src_lang,
+            speaker_count=speaker_count,
+        )
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     return {"job_id": job_id, "segments": segments}
@@ -169,6 +175,7 @@ async def pipeline_endpoint(
     job_id: str | None = Form(None),
     target_lang: str = Form(...),
     src_lang: str | None = Form(None),
+    speaker_count: int | None = Form(None, ge=1),
     prompt_text: str | None = Form(None),
 ):
     """
@@ -225,7 +232,12 @@ async def pipeline_endpoint(
     segments_payload: list[dict] = []
     sync_applied = False
     try:
-        run_asr(job_id, source_video_path, source_lang=src_lang)
+        run_asr(
+            job_id,
+            source_video_path,
+            source_lang=src_lang,
+            speaker_count=speaker_count,
+        )
         stage = "translate"
         translations = translate_transcript(job_id, target_lang, src_lang=src_lang)
         stage = "tts"

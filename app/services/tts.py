@@ -64,7 +64,7 @@ except Exception as exc:  # noqa: F841
     COSYVOICE_AVAILABLE = False
 
 
-PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "large-v2")
+PROMPT_STT_MODEL_ID = os.getenv("COSYVOICE_PROMPT_STT_MODEL", "large-v3")
 DEFAULT_TTS_DEVICE = (
     os.getenv("TTS_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 ).lower()
@@ -108,7 +108,7 @@ def _get_cosyvoice2():
 
 @lru_cache(maxsize=1)
 def _get_prompt_stt_model():
-    """Load the fast-whisper model (large-v2 by default) for prompt extraction."""
+    """Load the fast-whisper model (large-v3 by default) for prompt extraction."""
     from faster_whisper import WhisperModel
 
     device = PROMPT_STT_DEVICE if torch.cuda.is_available() else "cpu"

@@ -146,6 +146,7 @@ docker compose build --build-arg DOWNLOAD_COSYVOICE_MODELS=true worker
 1. 루트 `.env` 파일에 `HUGGINGFACE_TOKEN=hf_xxx` 형태로 저장합니다. (커밋 금지)
 2. `docker-compose.yml`이 `.env`를 `env_file`로 읽어 컨테이너 환경변수에 주입합니다.
 3. FastAPI `/asr` 엔드포인트는 더 이상 `hf_token` 입력을 받지 않으며, `run_asr`가 `HF_TOKEN`, `HUGGINGFACE_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `HUGGINGFACEHUB_API_TOKEN` 중 하나를 자동으로 찾아 pyannote diarization에 전달합니다.
+4. `/asr` 및 `/pipeline` 요청 본문에 `speaker_count`(정수, 1 이상)를 넘기면 pyannote diarization이 해당 화자 수를 기준으로 동작합니다. 지정하지 않으면 기존처럼 화자 수를 자동으로 추정합니다.
 
 ## Vertex AI 설정(번역)
 

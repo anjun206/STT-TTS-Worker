@@ -128,6 +128,52 @@ def upload_metadata_to_s3(bucket: str, key: str, metadata: dict) -> bool:
         return False
 
 
+def _resolve_s3_location(raw: str, default_bucket: str) -> tuple[str, str]:
+    """
+    Parse strings like 's3://bucket/key' or bare keys into (bucket, key).
+    Falls back to default_bucket when explicit bucket is missing.
+    """
+    value = (raw or "").strip()
+    if not value:
+        raise ValueError("빈 S3 위치 문자열입니다.")
+    if value.startswith("s3://"):
+        remainder = value[5:]
+        if "/" not in remainder:
+            raise ValueError(f"Invalid S3 URI: {raw}")
+        bucket, key = remainder.split("/", 1)
+        return bucket, key
+    key = value.lstrip("/")
+    return default_bucket, key
+
+
+def _sync_segment_to_range(
+    input_path: Path, target_duration_ms: int, output_path: Path
+) -> Path:
+    """
+    Coerce a single TTS clip to the requested duration by trimming or padding silence.
+    """
+    if target_duration_ms <= 0:
+        raise ValueError("target_duration_ms must be positive")
+
+    audio = AudioSegment.from_file(str(input_path))
+    current_ms = len(audio)
+    if current_ms == target_duration_ms:
+        if input_path != output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(input_path, output_path)
+        return output_path
+
+    if current_ms > target_duration_ms:
+        processed = audio[:target_duration_ms]
+    else:
+        silence = AudioSegment.silent(duration=target_duration_ms - current_ms)
+        processed = audio + silence
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    processed.export(str(output_path), format="wav")
+    return output_path
+
+
 def _segments_with_remote_audio_paths(
     segments: list[dict],
     project_prefix: str,
@@ -165,6 +211,81 @@ def _segments_with_remote_audio_paths(
     return normalized
 
 
+def _build_speaker_metadata(
+    paths: JobPaths, project_prefix: str, job_id: str
+) -> list[dict]:
+    """
+    Collect speaker metadata consisting of speaker name, uploaded sample key,
+    and optional prompt text.
+    """
+    speaker_refs_path = paths.vid_tts_dir / "speaker_refs.json"
+    if not speaker_refs_path.is_file():
+        return []
+    try:
+        refs = json.loads(speaker_refs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("Failed to parse %s: %s", speaker_refs_path, exc)
+        return []
+
+    remote_prefix = f"{project_prefix}/interim/{job_id}"
+    base_dir = paths.interim_dir.resolve()
+    metadata: list[dict] = []
+
+    for speaker, payload in refs.items():
+        if isinstance(payload, str):
+            audio_value = payload
+            prompt_text = ""
+        elif isinstance(payload, dict):
+            audio_value = payload.get("audio") or payload.get("path") or ""
+            prompt_text = (payload.get("text") or "").strip()
+        else:
+            continue
+
+        if not audio_value:
+            continue
+
+        sample_path = Path(audio_value)
+        if not sample_path.is_absolute():
+            sample_path = (paths.vid_tts_dir / sample_path).resolve()
+
+        try:
+            rel_path = sample_path.relative_to(base_dir)
+            voice_sample_key = f"{remote_prefix}/{rel_path.as_posix()}"
+        except ValueError:
+            logging.warning(
+                "Voice sample %s is outside interim dir; using absolute path.",
+                sample_path,
+            )
+            voice_sample_key = str(sample_path)
+
+        entry = {
+            "speaker": speaker,
+            "voice_sample_key": voice_sample_key,
+        }
+        if prompt_text:
+            entry["prompt_text"] = prompt_text
+        metadata.append(entry)
+
+    return metadata
+
+
+def _parse_positive_int(value, field_name: str) -> int | None:
+    """Optional int parser that tolerates strings and invalid inputs."""
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Ignoring %s=%r because it is not an integer", field_name, value
+        )
+        return None
+    if parsed < 1:
+        logging.warning("Ignoring %s=%r because it must be >= 1", field_name, value)
+        return None
+    return parsed
+
+
 def full_pipeline(job_details: dict):
     """전체 더빙 파이프라인을 실행합니다."""
     job_id = job_details["job_id"]
@@ -174,6 +295,9 @@ def full_pipeline(job_details: dict):
 
     target_lang = job_details.get("target_lang", "en")
     source_lang = job_details.get("source_lang")
+    speaker_count = _parse_positive_int(
+        job_details.get("speaker_count"), "speaker_count"
+    )
     voice_config = job_details.get("voice_config")
     input_bucket = job_details.get("input_bucket") or AWS_S3_BUCKET
     output_bucket = job_details.get("output_bucket") or AWS_S3_BUCKET
@@ -241,6 +365,7 @@ def full_pipeline(job_details: dict):
 
     translations: list[dict] = []
     segments_payload: list[dict] = []
+    speaker_metadata: list[dict] = []
     final_audio_path: Path | None = None
 
     try:
@@ -248,7 +373,12 @@ def full_pipeline(job_details: dict):
         send_callback(
             callback_url, "in_progress", "Starting ASR...", stage="asr_started"
         )
-        run_asr(job_id, source_video_path, source_lang=source_lang)
+        run_asr(
+            job_id,
+            source_video_path,
+            source_lang=source_lang,
+            speaker_count=speaker_count,
+        )
         # ASR 결과물(compact transcript)을 S3에 업로드
         from services.transcript_store import COMPACT_ARCHIVE_NAME
 
@@ -258,8 +388,53 @@ def full_pipeline(job_details: dict):
             f"{project_prefix}/interim/{job_id}/{COMPACT_ARCHIVE_NAME}",
             asr_result_path,
         )
+        # 원본 오디오(audio.wav)를 S3에 업로드
+        raw_audio_path = paths.vid_speaks_dir / "audio.wav"
+        audio_key = None
+        if raw_audio_path.is_file():
+            audio_key = f"{project_prefix}/interim/{job_id}/audio/audio.wav"
+            if upload_to_s3(output_bucket, audio_key, raw_audio_path):
+                logging.info(f"Raw audio uploaded to s3://{output_bucket}/{audio_key}")
+            else:
+                logging.warning("Failed to upload audio.wav to S3")
+
+        # 발화 음성(vocals.wav)과 배경음(background.wav)을 S3에 업로드
+        vocals_path = paths.vid_speaks_dir / "vocals.wav"
+        background_path = paths.vid_bgm_dir / "background.wav"
+
+        vocals_key = None
+        background_key = None
+
+        if vocals_path.is_file():
+            vocals_key = f"{project_prefix}/interim/{job_id}/audio/vocals.wav"
+            if upload_to_s3(output_bucket, vocals_key, vocals_path):
+                logging.info(f"Vocals uploaded to s3://{output_bucket}/{vocals_key}")
+            else:
+                logging.warning("Failed to upload vocals.wav to S3")
+
+        if background_path.is_file():
+            background_key = f"{project_prefix}/interim/{job_id}/audio/background.wav"
+            if upload_to_s3(output_bucket, background_key, background_path):
+                logging.info(
+                    f"Background uploaded to s3://{output_bucket}/{background_key}"
+                )
+            else:
+                logging.warning("Failed to upload background.wav to S3")
+
         send_callback(
-            callback_url, "in_progress", "ASR completed.", stage="asr_completed"
+            callback_url,
+            "in_progress",
+            "ASR completed.",
+            stage="asr_completed",
+            metadata=(
+                {
+                    "audio_key": audio_key,
+                    "vocals_key": vocals_key,
+                    "background_key": background_key,
+                }
+                if (audio_key or vocals_key or background_key)
+                else None
+            ),
         )
 
         # 5. 번역
@@ -307,8 +482,18 @@ def full_pipeline(job_details: dict):
                 )
             tts_key = f"{project_prefix}/interim/{job_id}/{relative_path}"
             upload_to_s3(output_bucket, str(tts_key), tts_file)
+        speaker_metadata = _build_speaker_metadata(paths, project_prefix, job_id)
         send_callback(
-            callback_url, "in_progress", "TTS completed.", stage="tts_completed"
+            callback_url,
+            "in_progress",
+            "TTS completed.",
+            stage="tts_completed",
+            metadata={
+                "job_id": job_id,
+                "project_id": project_id,
+                "speakers": speaker_metadata,
+                "speaker_count": len(speaker_metadata),
+            },
         )
 
         # 7. Sync
@@ -383,6 +568,8 @@ def full_pipeline(job_details: dict):
             "segments": metadata_segments,
             "segment_count": len(metadata_segments),
             "translations": translations,
+            "speakers": speaker_metadata,
+            "speaker_count": len(speaker_metadata),
         }
         if final_audio_path:
             metadata_payload["audio_artifact"] = str(final_audio_path)
@@ -397,6 +584,7 @@ def full_pipeline(job_details: dict):
             "result_key": result_key,
             "metadata_key": metadata_key,
             "segment_count": len(metadata_segments),
+            "speaker_count": len(speaker_metadata),
             "target_lang": target_lang,
         }
         if source_lang:
@@ -419,6 +607,176 @@ def full_pipeline(job_details: dict):
             stage="failed",
             metadata={"job_id": job_id, "project_id": project_id},
         )
+
+
+def _handle_tts_segments(job_details: dict) -> None:
+    """segment_tts / tts 작업을 처리합니다."""
+    job_id = job_details.get("job_id")
+    callback_url = job_details.get("callback_url")
+    segments_req = job_details.get("segments") or []
+
+    if not job_id or not callback_url:
+        raise ValueError("segment_tts requires both job_id and callback_url.")
+    if not segments_req:
+        raise ValueError("segment_tts requires at least one segment entry.")
+
+    project_id = job_details.get("project_id")
+    target_lang = job_details.get("target_lang", "ko")
+    mod_raw = (job_details.get("mod") or "dynamic").strip().lower()
+    mod = mod_raw if mod_raw in {"fixed", "dynamic"} else "dynamic"
+    output_bucket = job_details.get("output_bucket") or AWS_S3_BUCKET
+    project_prefix = f"projects/{project_id}" if project_id else "jobs"
+    remote_interim_prefix = f"{project_prefix}/interim/{job_id}"
+
+    send_callback(
+        callback_url,
+        "in_progress",
+        f"Starting segment TTS for job {job_id}",
+        stage="segment_tts_started",
+        metadata={"job_id": job_id, "project_id": project_id, "mod": mod},
+    )
+
+    try:
+        paths = ensure_job_dirs(job_id)
+        resynth_dir = paths.vid_tts_dir / "resynth"
+        resynth_dir.mkdir(parents=True, exist_ok=True)
+
+        speaker_spec = job_details.get("speaker_voices") or {}
+        voice_key = speaker_spec.get("key")
+        if not voice_key:
+            raise ValueError("speaker_voices.key is required for segment_tts.")
+        speaker_bucket = (
+            speaker_spec.get("bucket")
+            or job_details.get("input_bucket")
+            or output_bucket
+        )
+
+        speaker_asset_dir = paths.interim_dir / "speaker_assets"
+        speaker_asset_dir.mkdir(parents=True, exist_ok=True)
+
+        voice_bucket, resolved_voice_key = _resolve_s3_location(
+            voice_key, speaker_bucket
+        )
+        sample_path = speaker_asset_dir / Path(resolved_voice_key).name
+        if not download_from_s3(voice_bucket, resolved_voice_key, sample_path):
+            raise RuntimeError(
+                f"Failed to download speaker sample from {resolved_voice_key}"
+            )
+
+        prompt_text = (speaker_spec.get("text_prompt_value") or "").strip()
+        text_prompt_key = speaker_spec.get("text_prompt")
+        if not prompt_text and text_prompt_key:
+            prompt_bucket = (
+                speaker_spec.get("text_prompt_bucket")
+                or speaker_spec.get("bucket")
+                or job_details.get("input_bucket")
+                or output_bucket
+            )
+            prompt_bucket, prompt_key = _resolve_s3_location(
+                text_prompt_key, prompt_bucket
+            )
+            prompt_path = speaker_asset_dir / Path(prompt_key).name
+            if not download_from_s3(prompt_bucket, prompt_key, prompt_path):
+                raise RuntimeError(
+                    f"Failed to download speaker text prompt from {prompt_key}"
+                )
+            prompt_text = prompt_path.read_text(encoding="utf-8").strip()
+
+        if not prompt_text:
+            fallback_prompt = (job_details.get("prompt_text") or "").strip()
+            prompt_text = fallback_prompt or _transcribe_prompt_text(sample_path)
+
+        if not prompt_text:
+            raise ValueError("Unable to resolve prompt text for TTS segments.")
+
+        results: list[dict] = []
+        for idx, seg_req in enumerate(segments_req):
+            text = (seg_req.get("text") or "").strip()
+            if not text:
+                raise ValueError(f"Segment {idx} is missing 'text'.")
+
+            s_val = seg_req.get("s", seg_req.get("start"))
+            e_val = seg_req.get("e", seg_req.get("end"))
+
+            def _to_seconds(value) -> float | None:
+                if value is None or value == "":
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
+            s_sec = _to_seconds(s_val) or 0.0
+            e_sec = _to_seconds(e_val)
+
+            s_ms = max(0, int(s_sec * 1000))
+            e_ms = int(e_sec * 1000) if e_sec is not None else None
+
+            local_tts = resynth_dir / f"seg_{idx:04d}.wav"
+
+            _synthesize_with_cosyvoice2(
+                text=text,
+                prompt_text=prompt_text,
+                sample_path=sample_path,
+                output_path=local_tts,
+            )
+
+            synced_path = local_tts
+            if mod == "fixed":
+                if e_ms is None or e_ms <= s_ms:
+                    raise ValueError(f"Segment {idx} missing valid s/e for fixed mode.")
+                target_duration_ms = max(1, e_ms - s_ms)
+                synced_path = _sync_segment_to_range(
+                    local_tts,
+                    target_duration_ms,
+                    resynth_dir / f"seg_{idx:04d}_synced.wav",
+                )
+
+            try:
+                relative = synced_path.relative_to(paths.interim_dir)
+            except ValueError:
+                raise RuntimeError(
+                    f"TTS artifact {synced_path} is outside interim dir"
+                ) from None
+            s3_key = f"{remote_interim_prefix}/{relative.as_posix()}"
+            if not upload_to_s3(output_bucket, s3_key, synced_path):
+                raise RuntimeError(f"Failed to upload segment {idx} to S3.")
+
+            results.append(
+                {
+                    "index": idx,
+                    "text": text,
+                    "s": s_sec,
+                    "e": e_sec,
+                    "audio_key": s3_key,
+                    "bucket": output_bucket,
+                    "mod": mod,
+                }
+            )
+
+        send_callback(
+            callback_url,
+            "done",
+            "Segment TTS completed.",
+            stage="segment_tts_completed",
+            metadata={
+                "job_id": job_id,
+                "project_id": project_id,
+                "target_lang": target_lang,
+                "mod": mod,
+                "segments": results,
+            },
+        )
+    except Exception as exc:
+        logging.error("segment_tts failed for job %s: %s", job_id, exc, exc_info=True)
+        send_callback(
+            callback_url,
+            "failed",
+            f"Segment TTS failed: {exc}",
+            stage="segment_tts_failed",
+            metadata={"job_id": job_id, "project_id": project_id, "mod": mod},
+        )
+        raise
 
 
 def _handle_test_synthesis(job_details: dict):
@@ -613,6 +971,8 @@ async def poll_sqs():
 
                     if task == "test_synthesis":
                         _handle_test_synthesis(job_details)
+                    elif task in ("segment_tts", "tts"):
+                        _handle_tts_segments(job_details)
                     else:
                         # 파이프라인 실행
                         full_pipeline(job_details)

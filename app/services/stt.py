@@ -126,6 +126,7 @@ def run_asr(
     job_id: str,
     source_video_path: Path | str | None = None,
     source_lang: str | None = None,
+    speaker_count: int | None = None,
 ):
     """입력 영상을 WhisperX로 전사하고 화자 분리를 수행합니다.
 
@@ -134,8 +135,15 @@ def run_asr(
         source_video_path: 명시된 경우 해당 경로에서 오디오를 추출합니다.
         source_lang: 백엔드에서 지정한 원본 언어 코드(예: 'ko', 'en').
             지정되면 WhisperX가 언어를 자동으로 추론하지 않고 해당 언어를 사용합니다.
+        speaker_count: pyannote diarization이 예상 화자 수를 고정할 수 있도록 전달합니다.
+            1 이상의 정수를 지정하면 num_speakers hint로 전달되며, 생략하면 자동 추정합니다.
     """
     lang_override = _normalize_lang_code(source_lang)
+    normalized_speaker_count = None
+    if speaker_count is not None:
+        if speaker_count < 1:
+            raise ValueError("speaker_count must be >= 1")
+        normalized_speaker_count = int(speaker_count)
 
     paths = ensure_job_dirs(job_id)
     logger.info("ASR lang preference: %s", lang_override or "auto")
@@ -189,7 +197,7 @@ def run_asr(
     )
     try:
         model = whisperx.load_model(
-            "large-v2",
+            "large-v3",
             device=device,
             compute_type=compute_type,
             download_root=_whisperx_download_root("asr"),
@@ -205,7 +213,7 @@ def run_asr(
             fallback_compute,
         )
         model = whisperx.load_model(
-            "large-v2",
+            "large-v3",
             device=device,
             compute_type=fallback_compute,
             download_root=_whisperx_download_root("asr"),
@@ -287,7 +295,25 @@ def run_asr(
             use_auth_token=hf_token,
             device=device,
         )
-        diarization_segments = diarization_pipeline(str(vocals_audio_path))
+        diarization_kwargs = {}
+        if normalized_speaker_count:
+            diarization_kwargs["num_speakers"] = normalized_speaker_count
+            logger.info(
+                "Running diarization with speaker_count=%d", normalized_speaker_count
+            )
+        try:
+            diarization_segments = diarization_pipeline(
+                str(vocals_audio_path), **diarization_kwargs
+            )
+        except TypeError as exc:
+            if normalized_speaker_count and "num_speakers" in str(exc):
+                logger.warning(
+                    "Diarization pipeline rejected num_speakers hint (%s); retrying without it",
+                    exc,
+                )
+                diarization_segments = diarization_pipeline(str(vocals_audio_path))
+            else:
+                raise
         # 각 구간에 화자 레이블 부여
         result_segments = whisperx.assign_word_speakers(
             diarization_segments, result_aligned
