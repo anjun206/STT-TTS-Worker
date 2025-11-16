@@ -10,7 +10,7 @@ import sys
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict
 
 import torch
 import torchaudio
@@ -255,6 +255,7 @@ def _select_voice_sample(
     speaker_refs: Dict[str, SpeakerReferenceSample],
     paths,
     global_sample: Path | None = None,
+    speaker_override_refs: Dict[str, SpeakerReferenceSample] | None = None,
 ) -> tuple[Path, SpeakerReferenceSample | None]:
     """Pick the best voice-sample path (and metadata) for the segment."""
     override = seg.get("voice_sample_path") or seg.get("voice_sample")
@@ -265,6 +266,15 @@ def _select_voice_sample(
         return resolved, None
     if global_sample and global_sample.is_file():
         return global_sample, None
+    if speaker_override_refs:
+        override_ref = speaker_override_refs.get(speaker)
+        if override_ref:
+            path = override_ref.audio_path
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Override voice sample missing for speaker {speaker}: {path}"
+                )
+            return path, override_ref
     speaker = seg.get("speaker")
     if not speaker:
         raise ValueError("Segment is missing speaker information.")
@@ -509,6 +519,7 @@ def generate_tts(
     target_lang: str,
     voice_sample_path: Path | None = None,
     prompt_text_override: str | None = None,
+    speaker_voice_overrides: dict[str, dict[str, Any]] | None = None,
 ):
     """Use CosyVoice2 (if available) to synthesize translated segments."""
     if not COSYVOICE_AVAILABLE:
@@ -582,6 +593,44 @@ def generate_tts(
         else:
             logger.warning("제공된 보이스 샘플을 찾을 수 없습니다: %s", candidate)
 
+    replacement_meta = speaker_voice_overrides or {}
+    override_refs: Dict[str, SpeakerReferenceSample] = {}
+    if replacement_meta:
+        replacements_path = tts_dir / "voice_replacements.json"
+        try:
+            with open(replacements_path, "w", encoding="utf-8") as f:
+                json.dump(replacement_meta, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            logger.warning("Failed to persist voice replacement metadata: %s", exc)
+        for speaker, info in replacement_meta.items():
+            audio_value = info.get("audio_path")
+            if not audio_value:
+                continue
+            resolved = _resolve_path(str(audio_value), paths)
+            if not resolved.is_file():
+                logger.warning(
+                    "Voice replacement sample missing for %s at %s", speaker, resolved
+                )
+                continue
+            similarity_val = info.get("similarity")
+            try:
+                similarity_score = (
+                    float(similarity_val) if similarity_val is not None else None
+                )
+            except (TypeError, ValueError):
+                similarity_score = None
+            override_refs[speaker] = SpeakerReferenceSample(
+                speaker=speaker,
+                audio_path=resolved,
+                text=(info.get("prompt_text") or "").strip(),
+                segment_idx=-1,
+                segment_id=f"voice_replacement_{speaker}",
+                start_ms=0,
+                end_ms=0,
+                audio_duration_ms=0,
+                score=similarity_score,
+            )
+
     segment_lookup = {seg.idx: seg for seg in base_segments}
 
     def _synthesize_segment(seg) -> dict:
@@ -605,7 +654,11 @@ def generate_tts(
             "reference_text": override.get("reference_text"),
         }
         effective_sample, ref_info = _select_voice_sample(
-            seg_payload, speaker_refs, paths, normalized_user_sample
+            seg_payload,
+            speaker_refs,
+            paths,
+            normalized_user_sample,
+            override_refs if override_refs else None,
         )
 
         # 실제로 '글로벌 유저 샘플'을 쓰는 경우에만 override 사용
@@ -661,7 +714,7 @@ def generate_tts(
                 "Failed to inspect TTS duration for %s: %s", output_file, exc
             )
 
-        return {
+        entry = {
             "segment_id": seg.segment_id(),
             "seg_idx": seg.idx,
             "speaker": speaker,
@@ -676,6 +729,15 @@ def generate_tts(
             "tts_status": tts_status,
             "quality_note": quality_note,
         }
+        if speaker in override_refs:
+            replacement_info = replacement_meta.get(speaker, {})
+            entry["voice_replacement"] = {
+                "voice_id": replacement_info.get("voice_id"),
+                "similarity": replacement_info.get("similarity"),
+                "sample_key": replacement_info.get("sample_key"),
+                "sample_bucket": replacement_info.get("sample_bucket"),
+            }
+        return entry
 
     synthesized_segments: list[dict] = []
     suspect_indices: list[int] = []

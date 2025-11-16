@@ -6,3 +6,4 @@ soundfile>=0.12
 librosa>=0.10,<0.11
 pyrubberband
 soundfile
+resemblyzer>=0.1.2

@@ -4,6 +4,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import boto3
 import requests
@@ -18,6 +19,12 @@ from services.mux import mux_audio_video
 from configs import JobPaths, ensure_job_dirs
 from services.demucs_split import split_vocals
 from services.tts import _transcribe_prompt_text, _synthesize_with_cosyvoice2
+from services.speaker_embeddings import save_audio_embedding, load_embedding_index
+from services.voice_recommendation import (
+    VoiceReplacement,
+    load_voice_library,
+    recommend_voice_replacements,
+)
 from pydub import AudioSegment
 import shutil
 
@@ -33,6 +40,7 @@ for logger_name in noisy_loggers:
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 JOB_QUEUE_URL = os.getenv("JOB_QUEUE_URL")
 AWS_S3_BUCKET = os.getenv("AWS_S3_BUCKET")
+VOICE_LIBRARY_BUCKET = os.getenv("VOICE_LIBRARY_BUCKET") or AWS_S3_BUCKET
 
 if not all([JOB_QUEUE_URL, AWS_S3_BUCKET]):
     raise ValueError(
@@ -367,6 +375,39 @@ def _build_speaker_refs_metadata(
     return speaker_refs_metadata
 
 
+def _upload_speaker_embeddings(
+    paths: JobPaths,
+    job_id: str,
+    bucket: str,
+) -> dict:
+    """
+    Upload locally cached speaker embeddings to the shared voice-samples prefix.
+    Returns metadata describing uploaded S3 locations.
+    """
+    embedding_dir = paths.vid_tts_dir / "speaker_embeddings"
+    if not embedding_dir.is_dir():
+        return {}
+    uploaded: dict[str, str] = {}
+    base_prefix = f"voice-samples/jobs/{job_id}/embeddings"
+    for file in embedding_dir.glob("*.json"):
+        if not file.is_file():
+            continue
+        s3_key = f"{base_prefix}/{file.name}"
+        if upload_to_s3(bucket, s3_key, file):
+            uploaded[file.name] = f"s3://{bucket}/{s3_key}"
+    if not uploaded:
+        return {}
+    return {"prefix": f"s3://{bucket}/{base_prefix}", "files": uploaded}
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _parse_positive_int(value, field_name: str) -> int | None:
     """Optional int parser that tolerates strings and invalid inputs."""
     if value is None or value == "":
@@ -384,6 +425,101 @@ def _parse_positive_int(value, field_name: str) -> int | None:
     return parsed
 
 
+def _materialize_voice_replacements(
+    paths: JobPaths,
+    replacements: dict[str, VoiceReplacement],
+    default_bucket: str,
+) -> dict[str, dict]:
+    asset_dir = paths.interim_dir / "voice_replacements"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    prepared: dict[str, dict] = {}
+    for speaker, plan in replacements.items():
+        entry = plan.entry
+        local_path: Path | None = None
+        if entry.sample_path:
+            candidate = Path(entry.sample_path)
+            if not candidate.is_absolute():
+                candidate = (paths.interim_dir / candidate).resolve()
+            if candidate.is_file():
+                local_path = candidate
+            else:
+                logging.warning(
+                    "Voice replacement sample for %s not found at %s",
+                    entry.voice_id,
+                    candidate,
+                )
+                continue
+        elif entry.sample_key:
+            bucket = entry.sample_bucket or default_bucket
+            local_path = asset_dir / f"{speaker}_{entry.voice_id}.wav"
+            if not download_from_s3(bucket, entry.sample_key, local_path):
+                logging.warning(
+                    "Failed to download voice replacement sample %s from s3://%s/%s",
+                    entry.voice_id,
+                    bucket,
+                    entry.sample_key,
+                )
+                continue
+        else:
+            logging.warning("Voice library entry %s lacks sample reference.", entry.voice_id)
+            continue
+
+        prepared[speaker] = {
+            "audio_path": str(local_path),
+            "prompt_text": entry.prompt_text,
+            "voice_id": entry.voice_id,
+            "similarity": plan.similarity,
+            "sample_key": entry.sample_key,
+            "sample_bucket": entry.sample_bucket or default_bucket,
+            "metadata": entry.metadata or {},
+            "language": entry.language,
+        }
+    return prepared
+
+
+def _maybe_prepare_voice_replacements(
+    paths: JobPaths,
+    target_lang: str,
+    default_bucket: str,
+) -> tuple[dict[str, dict], dict[str, Any]]:
+    diagnostics: dict[str, Any] = {
+        "enabled": False,
+        "target_lang": target_lang,
+    }
+    index_path = paths.vid_tts_dir / "speaker_embeddings" / "speaker_embeddings.json"
+    embeddings = load_embedding_index(index_path)
+    if not embeddings:
+        diagnostics["reason"] = "missing_embeddings"
+        return {}, diagnostics
+
+    library = load_voice_library()
+    if not library:
+        diagnostics["reason"] = "library_unavailable"
+        return {}, diagnostics
+
+    replacements = recommend_voice_replacements(
+        embeddings,
+        library,
+        target_lang=target_lang,
+    )
+    if not replacements:
+        diagnostics["reason"] = "no_matches"
+        return {}, diagnostics
+
+    prepared = _materialize_voice_replacements(paths, replacements, default_bucket)
+    if not prepared:
+        diagnostics["reason"] = "materialization_failed"
+        return {}, diagnostics
+
+    diagnostics["enabled"] = True
+    diagnostics["reason"] = "ok"
+    diagnostics["matches"] = {
+        speaker: repl.summary() for speaker, repl in replacements.items()
+    }
+    diagnostics["prepared_speakers"] = sorted(prepared.keys())
+    return prepared, diagnostics
+
+
 def full_pipeline(job_details: dict):
     """전체 더빙 파이프라인을 실행합니다."""
     job_id = job_details["job_id"]
@@ -397,6 +533,13 @@ def full_pipeline(job_details: dict):
         job_details.get("speaker_count"), "speaker_count"
     )
     voice_config = job_details.get("voice_config")
+    voice_replacement_flag = (
+        job_details.get("replace_voice_samples")
+        or job_details.get("use_voice_replacement")
+        or job_details.get("voice_sample_substitution")
+    )
+    replace_voice_samples = _parse_bool(voice_replacement_flag)
+    voice_library_bucket = job_details.get("voice_library_bucket") or VOICE_LIBRARY_BUCKET
     input_bucket = job_details.get("input_bucket") or AWS_S3_BUCKET
     output_bucket = job_details.get("output_bucket") or AWS_S3_BUCKET
     project_prefix = f"projects/{project_id}" if project_id else "jobs"
@@ -465,6 +608,11 @@ def full_pipeline(job_details: dict):
     segments_payload: list[dict] = []
     speaker_metadata: list[dict] = []
     final_audio_path: Path | None = None
+    voice_replacement_meta: dict[str, Any] = {
+        "requested": replace_voice_samples,
+        "enabled": False,
+        "target_lang": target_lang,
+    }
 
     try:
         # 4. ASR (STT)
@@ -557,12 +705,25 @@ def full_pipeline(job_details: dict):
             stage="translation_completed",
         )
 
+        speaker_voice_overrides: dict[str, dict] = {}
+        if replace_voice_samples:
+            overrides, diagnostics = _maybe_prepare_voice_replacements(
+                paths, target_lang, voice_library_bucket or output_bucket
+            )
+            speaker_voice_overrides = overrides
+            voice_replacement_meta.update(diagnostics)
+        else:
+            voice_replacement_meta["reason"] = "not_requested"
+
         # 6. TTS
         send_callback(
             callback_url, "in_progress", "Starting TTS...", stage="tts_started"
         )
         segments_payload = generate_tts(
-            job_id, target_lang, voice_sample_path=user_voice_sample_path
+            job_id,
+            target_lang,
+            voice_sample_path=user_voice_sample_path,
+            speaker_voice_overrides=speaker_voice_overrides if speaker_voice_overrides else None,
         )
         # TTS 결과물(개별 wav 파일 및 segments.json)을 S3에 업로드
         tts_dir = paths.vid_tts_dir
@@ -591,6 +752,7 @@ def full_pipeline(job_details: dict):
                 "project_id": project_id,
                 "speakers": speaker_metadata,
                 "speaker_count": len(speaker_metadata),
+                "voice_replacement": voice_replacement_meta,
             },
         )
 
@@ -668,6 +830,7 @@ def full_pipeline(job_details: dict):
             "translations": translations,
             "speakers": speaker_metadata,
             "speaker_count": len(speaker_metadata),
+            "voice_replacement": voice_replacement_meta,
         }
         if final_audio_path:
             metadata_payload["audio_artifact"] = str(final_audio_path)
@@ -678,6 +841,9 @@ def full_pipeline(job_details: dict):
         # 10. Speaker reference samples를 S3에 업로드하고 콜백으로 전달
         speaker_refs_metadata = _build_speaker_refs_metadata(
             paths, project_prefix, job_id, output_bucket
+        )
+        speaker_embeddings_metadata = _upload_speaker_embeddings(
+            paths, job_id, output_bucket
         )
 
         final_metadata = {
@@ -694,6 +860,10 @@ def full_pipeline(job_details: dict):
             final_metadata["source_lang"] = source_lang
         if speaker_refs_metadata:
             final_metadata["speaker_refs"] = speaker_refs_metadata
+        if voice_replacement_meta:
+            final_metadata["voice_replacement"] = voice_replacement_meta
+        if speaker_embeddings_metadata:
+            final_metadata["speaker_embeddings"] = speaker_embeddings_metadata
 
         send_callback(
             callback_url,
@@ -980,6 +1150,8 @@ def _handle_test_synthesis(job_details: dict):
             f"Failed to check/trim audio duration: {e}, continuing with original file"
         )
 
+    embedding_s3_key: str | None = None
+
     try:
         # 3. Demucs 전처리: 보이스 샘플을 paths.vid_speaks_dir/audio.wav에 복사
         # split_vocals는 paths.vid_speaks_dir/audio.wav를 찾으므로 복사 필요
@@ -990,6 +1162,32 @@ def _handle_test_synthesis(job_details: dict):
         logging.info("Running Demucs for vocal separation...")
         demucs_result = split_vocals(job_id)
         vocals_path = Path(demucs_result["vocals"])
+
+        try:
+            sample_label = voice_sample_id or Path(file_path).stem or job_id
+            embedding_path = paths.outputs_dir / "voice_sample_embedding.json"
+            save_audio_embedding(
+                vocals_path,
+                embedding_path,
+                label=sample_label,
+                base_dir=paths.interim_dir,
+                meta={
+                    "job_id": job_id,
+                    "source": "voice_sample",
+                    "voice_sample_id": voice_sample_id,
+                },
+            )
+            embedding_s3_key = f"voice-samples/{sample_label}/embedding.json"
+            if upload_to_s3(AWS_S3_BUCKET, embedding_s3_key, embedding_path):
+                logging.info(
+                    "Voice sample embedding uploaded to s3://%s/%s",
+                    AWS_S3_BUCKET,
+                    embedding_s3_key,
+                )
+            else:
+                embedding_s3_key = None
+        except Exception as exc:
+            logging.warning("Failed to persist voice sample embedding: %s", exc)
 
         send_callback(
             callback_url,
@@ -1051,6 +1249,7 @@ def _handle_test_synthesis(job_details: dict):
                 "audio_sample_url": audio_sample_url,
                 "voice_sample_id": voice_sample_id,
                 "prompt_text": prompt_text,
+                "embedding_key": embedding_s3_key,
             },
         )
         logging.info(f"Job {job_id} completed successfully")

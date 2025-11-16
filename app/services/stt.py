@@ -47,10 +47,8 @@ from services.transcript_store import (
     segment_preview,
     segment_views,
 )
-from services.self_reference import (  # NEW
-    prepare_self_reference_samples,
-    serialize_reference_mapping,
-)
+from services.self_reference import prepare_self_reference_samples, serialize_reference_mapping
+from services.speaker_embeddings import build_reference_embeddings
 from services.demucs_split import split_vocals
 
 logger = logging.getLogger(__name__)
@@ -347,6 +345,14 @@ def run_asr(
         mapping = serialize_reference_mapping(speaker_refs, tts_dir)
         with open(tts_dir / "speaker_refs.json", "w", encoding="utf-8") as f:
             json.dump(mapping, f, ensure_ascii=False, indent=2)
+        # self-reference와 동일한 위치에 스피커 임베딩을 생성한다.
+        # (prod에서는 s3://<bucket>/voice-samples/ 로 동기화 예정)
+        embeddings_dir = tts_dir / "speaker_embeddings"
+        build_reference_embeddings(
+            speaker_refs,
+            embeddings_dir,
+            base_dir=paths.interim_dir,
+        )
         logger.info(
             "Saved self-reference mapping for %d speakers at %s",
             len(mapping),
