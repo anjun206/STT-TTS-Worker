@@ -20,7 +20,11 @@ from services.sync import sync_segments, _sync_single_segment, MAX_SLOW_RATIO
 from services.mux import mux_audio_video
 from configs import JobPaths, ensure_job_dirs
 from services.demucs_split import split_vocals
-from services.tts import _transcribe_prompt_text, _synthesize_with_cosyvoice2
+from services.tts import (
+    _transcribe_prompt_text,
+    _trim_tts_artifacts,
+    _synthesize_with_cosyvoice2,
+)
 from services.transcript_store import COMPACT_ARCHIVE_NAME, read_transcript_language
 from services.speaker_embeddings import (
     load_embedding_index,
@@ -1073,6 +1077,7 @@ def _handle_tts_segments(job_details: dict) -> None:
         resynth_dir = paths.vid_tts_dir / "resynth"
         resynth_dir.mkdir(parents=True, exist_ok=True)
 
+        # --- 보이스 샘플 준비 ---
         speaker_spec = job_details.get("speaker_voices") or {}
         voice_key = speaker_spec.get("key")
         if not voice_key:
@@ -1116,6 +1121,7 @@ def _handle_tts_segments(job_details: dict) -> None:
                 f"Failed to check/trim voice sample duration: {e}, continuing with original file"
             )
 
+        # --- 텍스트 프롬프트 준비 ---
         prompt_text = (speaker_spec.get("text_prompt_value") or "").strip()
         text_prompt_key = speaker_spec.get("text_prompt")
         if not prompt_text and text_prompt_key:
@@ -1142,8 +1148,18 @@ def _handle_tts_segments(job_details: dict) -> None:
         if not prompt_text:
             raise ValueError("Unable to resolve prompt text for TTS segments.")
 
+        # --- 세그먼트별 TTS ---
         results: list[dict] = []
-        for seg_req in segments_req:
+
+        def _to_seconds(value) -> float | None:
+            if value is None or value == "":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        for idx, seg_req in enumerate(segments_req):
             text = (seg_req.get("text") or "").strip()
             if not text:
                 raise ValueError("Segment is missing 'text'.")
@@ -1151,23 +1167,17 @@ def _handle_tts_segments(job_details: dict) -> None:
             s_val = seg_req.get("s", seg_req.get("start"))
             e_val = seg_req.get("e", seg_req.get("end"))
 
-            def _to_seconds(value) -> float | None:
-                if value is None or value == "":
-                    return None
-                try:
-                    return float(value)
-                except (TypeError, ValueError):
-                    return None
-
             s_sec = _to_seconds(s_val) or 0.0
             e_sec = _to_seconds(e_val)
 
             s_ms = max(0, int(s_sec * 1000))
             e_ms = int(e_sec * 1000) if e_sec is not None else None
 
-            # job_id를 파일명에 사용
-            local_tts = resynth_dir / f"{job_id}.wav"
+            # 각 세그먼트별로 고유한 파일명 사용
+            local_tts = resynth_dir / f"{job_id}_{idx}.wav"
+            synced_tts = resynth_dir / f"{job_id}_{idx}_synced.wav"
 
+            # 1) CosyVoice2로 합성
             _synthesize_with_cosyvoice2(
                 text=text,
                 prompt_text=prompt_text,
@@ -1175,6 +1185,10 @@ def _handle_tts_segments(job_details: dict) -> None:
                 output_path=local_tts,
             )
 
+            # 2) full_pipeline과 동일하게 TTS 아티팩트 / 침묵 트리밍
+            _trim_tts_artifacts(local_tts)
+
+            # 3) fixed 모드면 원래 [s, e] 길이에 맞춰 sync
             synced_path = local_tts
             if mod == "fixed":
                 if e_ms is None or e_ms <= s_ms:
@@ -1183,15 +1197,17 @@ def _handle_tts_segments(job_details: dict) -> None:
                 synced_path = _sync_segment_to_range(
                     local_tts,
                     target_duration_ms,
-                    resynth_dir / f"{job_id}_synced.wav",
+                    synced_tts,
                 )
 
+            # 4) S3 업로드
             try:
                 relative = synced_path.relative_to(paths.interim_dir)
             except ValueError:
                 raise RuntimeError(
                     f"TTS artifact {synced_path} is outside interim dir"
                 ) from None
+
             s3_key = f"{remote_interim_prefix}/{relative.as_posix()}"
             if not upload_to_s3(output_bucket, s3_key, synced_path):
                 raise RuntimeError("Failed to upload segment to S3.")

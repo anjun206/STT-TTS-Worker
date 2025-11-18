@@ -1,4 +1,5 @@
 """Helpers for computing per-segment quality diagnostics."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -29,6 +30,22 @@ def tts_quality_from_ratio(ratio: Optional[float]) -> Optional[int]:
     return int(round(normalized * 100))
 
 
+def voice_quality_from_similarity(similarity: Optional[float]) -> Optional[int]:
+    """
+    0.0~1.0 코사인 유사도를 0~100 점수로 변환.
+    0.5 이상이면 대략 정상 영역, 그 이하는 점점 나쁜 쪽으로 본다.
+    """
+    if similarity is None:
+        return None
+    try:
+        sim = float(similarity)
+    except (TypeError, ValueError):
+        return None
+    sim = _clamp(sim, 0.0, 1.0)
+    # 0.0 -> 0점, 1.0 -> 100점
+    return int(round(sim * 100))
+
+
 def sync_percent_from_durations(
     source_seconds: Optional[float], synced_seconds: Optional[float]
 ) -> Optional[int]:
@@ -56,6 +73,7 @@ def ensure_issue_payload(existing: Optional[Dict[str, Any]] = None) -> Dict[str,
     q_payload.setdefault("stt", None)
     q_payload.setdefault("tts", None)
     q_payload.setdefault("sync", None)
+    q_payload.setdefault("voice", None)
     if "spk" not in issues:
         issues["spk"] = issues.get("spk")
     return issues
@@ -67,6 +85,8 @@ def build_segment_issues(
     tts_ratio: Optional[float] = None,
     sync_percent: Optional[int] = None,
     speaker_unknown: Optional[bool] = None,
+    voice_similarity: Optional[float] = None,
+    voice_low_similarity_forced: Optional[bool] = None,
     base: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Attach the requested metrics (if provided) to the issue payload."""
@@ -78,8 +98,12 @@ def build_segment_issues(
         q_payload["tts"] = tts_quality_from_ratio(tts_ratio)
     if sync_percent is not None:
         q_payload["sync"] = sync_percent
+    if voice_similarity is not None:
+        q_payload["voice"] = voice_quality_from_similarity(voice_similarity)
     if speaker_unknown is not None:
         issues["spk"] = bool(speaker_unknown)
     elif "spk" not in issues or issues["spk"] is None:
         issues["spk"] = False
+    if voice_low_similarity_forced is not None:
+        issues["voice_low_sim_forced"] = bool(voice_low_similarity_forced)
     return issues

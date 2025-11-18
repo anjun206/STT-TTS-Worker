@@ -729,18 +729,39 @@ def generate_tts(
             "tts_status": tts_status,
             "quality_note": quality_note,
         }
+        # 보이스 유사도/강제 대체 정보 계산
+        replacement_info = replacement_meta.get(speaker, {}) if replacement_meta else {}
+        voice_similarity: float | None = None
+        voice_low_sim_forced: bool | None = None
+
+        sim_raw = replacement_info.get("similarity")
+        if sim_raw is not None:
+            try:
+                voice_similarity = float(sim_raw)
+            except (TypeError, ValueError):
+                voice_similarity = None
+
+        # “라이브러리에서 골라온 대체 보이스”인 경우에만 강제 여부 판단
+        if speaker in override_refs and voice_similarity is not None:
+            LOW_SIM_THRESHOLD = 0.45  # 코사인 0.45 이하면 낮은 편으로 봄 (조절 가능)
+            if voice_similarity < LOW_SIM_THRESHOLD:
+                voice_low_sim_forced = True
+
+        # 기존 issues 호출을 voice 인자까지 넘기도록 확장
         entry["issues"] = build_segment_issues(
             stt_score_q=seg.score_q,
             tts_ratio=duration_ratio,
             speaker_unknown=seg.speaker_unknown,
+            voice_similarity=voice_similarity,
+            voice_low_similarity_forced=voice_low_sim_forced,
         )
         if speaker in override_refs:
-            replacement_info = replacement_meta.get(speaker, {})
             entry["voice_replacement"] = {
                 "voice_id": replacement_info.get("voice_id"),
-                "similarity": replacement_info.get("similarity"),
+                "similarity": voice_similarity,
                 "sample_key": replacement_info.get("sample_key"),
                 "sample_bucket": replacement_info.get("sample_bucket"),
+                "language": replacement_info.get("language"),
             }
         return entry
 
