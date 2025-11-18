@@ -19,6 +19,7 @@ from services.demucs_split import split_vocals
 from services.translate import translate_transcript
 from services.tts import (
     generate_tts,
+    _strip_background_from_sample,
     _transcribe_prompt_text,
     _synthesize_with_cosyvoice2,
 )
@@ -505,6 +506,94 @@ async def voice_sample_test_endpoint(
         "prompt_text": prompt_text,
         "library_entry": library_entry,
     }
+
+
+@app.post("/tts/test")
+async def tts_test_endpoint(
+    text: str = Form(...),
+    voice_sample: UploadFile = File(...),
+    src_lang: str | None = Form(None),
+):
+    """Upload a short reference clip and synthesize TTS immediately."""
+    text_value = (text or "").strip()
+    if not text_value:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "text is required"},
+        )
+    if not voice_sample.filename:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "voice_sample file is required"},
+        )
+
+    job_id = str(uuid.uuid4())
+    paths = ensure_job_dirs(job_id)
+    work_dir = paths.interim_dir / "tts_test"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix = Path(voice_sample.filename).suffix or ".wav"
+    raw_sample_path = work_dir / f"uploaded_sample{suffix}"
+    sample_bytes = await voice_sample.read()
+    with open(raw_sample_path, "wb") as f:
+        f.write(sample_bytes)
+
+    normalized_sample_path = work_dir / "tts_test_input.wav"
+    try:
+        audio = AudioSegment.from_file(str(raw_sample_path))
+        max_duration_ms = 30 * 1000
+        if len(audio) > max_duration_ms:
+            audio = audio[:max_duration_ms]
+        audio.set_frame_rate(16000).set_channels(1).export(
+            str(normalized_sample_path),
+            format="wav",
+        )
+    except Exception as exc:
+        logging.warning("Failed to normalize uploaded voice sample: %s", exc)
+        shutil.copy(raw_sample_path, normalized_sample_path)
+
+    cleaned_sample_path = _strip_background_from_sample(
+        normalized_sample_path, work_dir
+    )
+
+    final_sample_path = work_dir / "tts_test_voice.wav"
+    try:
+        cleaned_audio = AudioSegment.from_file(str(cleaned_sample_path))
+        cleaned_audio.set_frame_rate(16000).set_channels(1).export(
+            str(final_sample_path),
+            format="wav",
+        )
+    except Exception as exc:
+        logging.warning("Failed to convert cleaned sample: %s", exc)
+        shutil.copy(cleaned_sample_path, final_sample_path)
+
+    lang_hint = (src_lang or "").strip()
+    prompt_value = (
+        _transcribe_prompt_text(final_sample_path, language=lang_hint or None)
+        or text_value
+    )
+
+    output_path = paths.outputs_dir / "tts_test.wav"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _synthesize_with_cosyvoice2(
+            text_value, prompt_value, final_sample_path, output_path
+        )
+    except Exception as exc:
+        logging.exception("TTS test synthesis failed")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"TTS synthesis failed: {exc}"},
+        )
+
+    download_name = f"tts_test_{job_id}.wav"
+    return FileResponse(
+        output_path,
+        media_type="audio/wav",
+        filename=download_name,
+        headers={"X-Job-Id": job_id},
+    )
 
 
 @app.post("/sync")

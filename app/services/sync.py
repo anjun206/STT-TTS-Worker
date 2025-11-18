@@ -16,6 +16,7 @@ except ModuleNotFoundError as exc:
     if exc.name != "app":
         raise
     from configs import get_job_paths
+from services.segment_quality import build_segment_issues, sync_percent_from_durations
 from services.transcript_store import (
     COMPACT_ARCHIVE_NAME,
     load_compact_transcript,
@@ -83,7 +84,7 @@ def _sync_single_segment(
         raise RuntimeError("시간 조정 결과가 비정상입니다.")
 
     # 무음 패딩
-    # padding_ms = 0
+    padding_ms = 0
     # if hit_slow_cap and len(stretched) < target_ms:
     #     padding_ms = target_ms - len(stretched)
     #     stretched += AudioSegment.silent(duration=padding_ms)
@@ -169,6 +170,16 @@ def sync_segments(job_id: str) -> List[Dict]:
         ]:
             if key in entry:
                 synced_entry[key] = entry[key]
+
+        sync_percent = sync_percent_from_durations(
+            source_duration_sec, synced_duration_sec
+        )
+        synced_entry["issues"] = build_segment_issues(
+            stt_score_q=getattr(source_seg, "score_q", None),
+            base=entry.get("issues"),
+            sync_percent=sync_percent,
+            speaker_unknown=getattr(source_seg, "speaker_unknown", None),
+        )
 
         synced_metadata.append(synced_entry)
 

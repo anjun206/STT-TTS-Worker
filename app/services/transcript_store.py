@@ -82,6 +82,7 @@ class SegmentView:
     start_ms: int
     end_ms: int
     speaker: str
+    speaker_unknown: bool
     text: str
     gap_after_ms: int | None
     gap_after_vad_ms: int | None
@@ -121,6 +122,7 @@ class SegmentView:
             "idx": self.idx,
             "segment_id": self.segment_id(),
             "speaker": self.speaker,
+            "speaker_unknown": self.speaker_unknown,
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
             "start": _ms_to_seconds(self.start_ms),
@@ -279,13 +281,17 @@ def segment_views(bundle: dict) -> List[SegmentView]:
         start_ms = int(seg.get("s") or 0)
         end_ms = int(seg.get("e") or start_ms)
         sp_idx = seg.get("sp")
-        speaker = (
-            speakers[sp_idx]
-            if isinstance(sp_idx, int) and 0 <= sp_idx < len(speakers)
-            else UNKNOWN_SPEAKER_NAME
-        )
-        if speaker == UNKNOWN_SPEAKER_NAME:
+        speaker_unknown = False
+        if isinstance(sp_idx, int) and 0 <= sp_idx < len(speakers):
+            resolved_speaker = speakers[sp_idx]
+        else:
+            resolved_speaker = UNKNOWN_SPEAKER_NAME
+            speaker_unknown = True
+        if resolved_speaker == UNKNOWN_SPEAKER_NAME:
+            speaker_unknown = True
             speaker = DEFAULT_SPEAKER_NAME
+        else:
+            speaker = resolved_speaker
         gap = seg.get("gap") or [None, None]
         w_off = seg.get("w_off") or [0, 0]
         score_q = seg.get("sc")
@@ -298,6 +304,7 @@ def segment_views(bundle: dict) -> List[SegmentView]:
                 start_ms=start_ms,
                 end_ms=end_ms,
                 speaker=speaker,
+                speaker_unknown=speaker_unknown,
                 text=seg.get("txt") or "",
                 gap_after_ms=gap[0],
                 gap_after_vad_ms=gap[1],

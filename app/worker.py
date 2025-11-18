@@ -43,6 +43,19 @@ noisy_loggers = ["boto3", "botocore", "s3transfer", "urllib3"]
 for logger_name in noisy_loggers:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
 
+# Numba 디버그 로그 억제
+for name in [
+    "numba",
+    "numba.core",
+    "numba.core.ssa",
+    "numba.core.byteflow",
+    "numba.core.typeinfer",
+]:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False  # 부모(root)로 안 올리게
+    logger.handlers.clear()  # 혹시 자기 handler 갖고 있으면 날려버리기
+
 # AWS 설정
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 JOB_QUEUE_URL = os.getenv("JOB_QUEUE_URL")
@@ -610,7 +623,17 @@ def full_pipeline(job_details: dict):
     paths = ensure_job_dirs(job_id)
     source_video_path = paths.input_dir / Path(input_key).name
 
+    # 파이프라인 시간 측정 초기화
+    timing_info = {
+        "job_id": job_id,
+        "project_id": project_id,
+        "pipeline_start_time": time.time(),
+        "stages": {},
+    }
+
     # 2. S3에서 원본 영상 다운로드
+    stage_name = "download"
+    stage_start = time.time()
     if not download_from_s3(input_bucket, input_key, source_video_path):
         send_callback(
             callback_url,
@@ -620,6 +643,12 @@ def full_pipeline(job_details: dict):
             metadata={"job_id": job_id, "project_id": project_id},
         )
         return
+    stage_end = time.time()
+    timing_info["stages"][stage_name] = {
+        "start_time": stage_start,
+        "end_time": stage_end,
+        "duration_seconds": stage_end - stage_start,
+    }
 
     # 3. voice_config에서 사용자 음성 샘플 다운로드 (필요 시)
     user_voice_sample_path = None
@@ -663,6 +692,8 @@ def full_pipeline(job_details: dict):
 
     try:
         # 4. ASR (STT)
+        stage_name = "asr"
+        stage_start = time.time()
         send_callback(
             callback_url, "in_progress", "Starting ASR...", stage="asr_started"
         )
@@ -672,6 +703,12 @@ def full_pipeline(job_details: dict):
             source_lang=source_lang,
             speaker_count=speaker_count,
         )
+        stage_end = time.time()
+        timing_info["stages"][stage_name] = {
+            "start_time": stage_start,
+            "end_time": stage_end,
+            "duration_seconds": stage_end - stage_start,
+        }
         # ASR 결과물(compact transcript)을 S3에 업로드
         asr_result_path = paths.src_sentence_dir / COMPACT_ARCHIVE_NAME
         upload_to_s3(
@@ -732,6 +769,8 @@ def full_pipeline(job_details: dict):
         )
 
         # 5. 번역
+        stage_name = "translation"
+        stage_start = time.time()
         send_callback(
             callback_url,
             "in_progress",
@@ -741,6 +780,12 @@ def full_pipeline(job_details: dict):
         translations = translate_transcript(
             job_id, target_lang, src_lang=effective_source_lang
         )
+        stage_end = time.time()
+        timing_info["stages"][stage_name] = {
+            "start_time": stage_start,
+            "end_time": stage_end,
+            "duration_seconds": stage_end - stage_start,
+        }
         # 번역 결과물(translated.json)을 S3에 업로드
         trans_result_path = paths.trg_sentence_dir / "translated.json"
         upload_to_s3(
@@ -764,6 +809,8 @@ def full_pipeline(job_details: dict):
             voice_replacement_meta.setdefault("reason", "not_requested")
 
         # 6. TTS
+        stage_name = "tts"
+        stage_start = time.time()
         send_callback(
             callback_url, "in_progress", "Starting TTS...", stage="tts_started"
         )
@@ -775,6 +822,12 @@ def full_pipeline(job_details: dict):
                 speaker_voice_overrides if speaker_voice_overrides else None
             ),
         )
+        stage_end = time.time()
+        timing_info["stages"][stage_name] = {
+            "start_time": stage_start,
+            "end_time": stage_end,
+            "duration_seconds": stage_end - stage_start,
+        }
         # TTS 결과물(개별 wav 파일 및 segments.json)을 S3에 업로드
         tts_dir = paths.vid_tts_dir
         for tts_file in tts_dir.glob("**/*"):
@@ -807,6 +860,8 @@ def full_pipeline(job_details: dict):
         )
 
         # 7. Sync
+        stage_name = "sync"
+        stage_start = time.time()
         send_callback(
             callback_url, "in_progress", "Starting sync...", stage="sync_started"
         )
@@ -839,22 +894,34 @@ def full_pipeline(job_details: dict):
                 )
             sync_key = f"{project_prefix}/interim/{job_id}/{relative_path}"
             upload_to_s3(output_bucket, str(sync_key), sync_file)
+        stage_end = time.time()
+        timing_info["stages"][stage_name] = {
+            "start_time": stage_start,
+            "end_time": stage_end,
+            "duration_seconds": stage_end - stage_start,
+        }
         send_callback(
             callback_url, "in_progress", "Sync completed.", stage="sync_completed"
         )
 
         # 8. Mux
+        stage_name = "mux"
+        stage_start = time.time()
         send_callback(
             callback_url, "in_progress", "Starting mux...", stage="mux_started"
         )
         mux_results = mux_audio_video(job_id, source_video_path)
+        stage_end = time.time()
+        timing_info["stages"][stage_name] = {
+            "start_time": stage_start,
+            "end_time": stage_end,
+            "duration_seconds": stage_end - stage_start,
+        }
         output_video_path = Path(mux_results["output_video"])
         final_audio_path = Path(mux_results["output_audio"])
 
         # 9. 최종 결과물 S3에 업로드
-        result_key = (
-            job_details.get("result_key") or f"{output_prefix}/{output_video_path.name}"
-        )
+        result_key = f"projects/{project_id}/outputs/dubbed_video.mp4"
         if not upload_to_s3(output_bucket, result_key, output_video_path):
             raise Exception("Failed to upload final video to S3")
 
@@ -920,6 +987,30 @@ def full_pipeline(job_details: dict):
             final_metadata["speaker_refs"] = speaker_refs_metadata
         if speaker_embeddings_metadata:
             final_metadata["speaker_embeddings"] = speaker_embeddings_metadata
+
+        # 파이프라인 종료 시간 계산 및 요약
+        pipeline_end_time = time.time()
+        timing_info["pipeline_end_time"] = pipeline_end_time
+        timing_info["total_duration_seconds"] = (
+            pipeline_end_time - timing_info["pipeline_start_time"]
+        )
+
+        # 각 단계별 소요 시간 요약 추가
+        timing_summary = {}
+        for stage, info in timing_info["stages"].items():
+            timing_summary[stage] = {
+                "duration_seconds": round(info["duration_seconds"], 2),
+                "duration_minutes": round(info["duration_seconds"] / 60, 2),
+            }
+        timing_info["summary"] = timing_summary
+        timing_info["total_duration_minutes"] = round(
+            timing_info["total_duration_seconds"] / 60, 2
+        )
+
+        # 시간 정보를 S3에 업로드
+        timing_key = f"{project_prefix}/full_pipeline_timing.json"
+        if not upload_metadata_to_s3(output_bucket, timing_key, timing_info):
+            logging.warning(f"Failed to upload timing info to S3: {timing_key}")
 
         send_callback(
             callback_url,
@@ -1002,6 +1093,27 @@ def _handle_tts_segments(job_details: dict) -> None:
         if not download_from_s3(voice_bucket, resolved_voice_key, sample_path):
             raise RuntimeError(
                 f"Failed to download speaker sample from {resolved_voice_key}"
+            )
+
+        # CosyVoice는 30초를 초과하는 오디오에서 speech token을 추출할 수 없으므로 30초로 자름
+        try:
+            audio = AudioSegment.from_file(str(sample_path))
+            max_duration_ms = 30 * 1000  # 30초 = 30000ms
+
+            if len(audio) > max_duration_ms:
+                logging.info(
+                    f"Voice sample is {len(audio)/1000:.2f}s, trimming to 30s for CosyVoice compatibility"
+                )
+                audio = audio[:max_duration_ms]
+                audio.export(str(sample_path), format="wav")
+                logging.info("Voice sample trimmed to 30 seconds")
+            else:
+                logging.debug(
+                    f"Voice sample is {len(audio)/1000:.2f}s, no trimming needed"
+                )
+        except Exception as e:
+            logging.warning(
+                f"Failed to check/trim voice sample duration: {e}, continuing with original file"
             )
 
         prompt_text = (speaker_spec.get("text_prompt_value") or "").strip()
@@ -1184,23 +1296,29 @@ def _handle_test_synthesis(job_details: dict):
         "Voice sample downloaded, starting preprocessing...",
         stage="downloaded",
     )
-    send_callback(
-        callback_url,
-        "in_progress",
-        "Voice sample downloaded, starting preprocessing...",
-        stage="downloaded",
-    )
 
-    # 2-1. 오디오 파일이 30초를 넘으면 30초로 자르기
+    # 2-1. 오디오 파일이 15초를 넘으면 15초로 자르기
+    trimmed = False
     try:
         audio = AudioSegment.from_file(str(local_voice_sample))
-        max_duration_ms = 30 * 1000  # 30초 = 30000ms
+        max_duration_ms = 15 * 1000  # 15초 = 15000ms
 
         if len(audio) > max_duration_ms:
-            logging.info(f"Audio file is {len(audio)/1000:.2f}s, trimming to 30s")
+            logging.info(f"Audio file is {len(audio)/1000:.2f}s, trimming to 15s")
             audio = audio[:max_duration_ms]
             audio.export(str(local_voice_sample), format="wav")
             logging.info("Audio file trimmed to 30 seconds")
+            trimmed = True
+
+            # 30초로 자른 경우 원본 S3 파일도 업데이트
+            if upload_to_s3(AWS_S3_BUCKET, file_path, local_voice_sample):
+                logging.info(
+                    f"Updated original S3 file at s3://{AWS_S3_BUCKET}/{file_path} with trimmed version"
+                )
+            else:
+                logging.warning(
+                    f"Failed to update original S3 file at s3://{AWS_S3_BUCKET}/{file_path}"
+                )
         else:
             logging.info(f"Audio file is {len(audio)/1000:.2f}s, no trimming needed")
     except Exception as e:

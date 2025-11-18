@@ -114,11 +114,19 @@ UTF-8 JSON 배열이며 각 요소는 다음을 포함해야 합니다.
 | `voice_sample`    | CosyVoice에 투입된 레퍼런스 오디오 경로.   |
 | `prompt_text`     | TTS 백엔드에 전달된 프롬프트 문자열.       |
 | `tts_backend`     | 합성기 식별자(현재 `"cosyvoice2"`).        |
+| `source_text`     | ASR이 추출한 원문 텍스트.                  |
+| `issues.q`        | 품질 진단. `stt`/`tts`는 0~100 점수, `sync`는 길이 차이%(동기화 전에는 `null`). |
+| `issues.spk`      | STT 화자 식별 실패 여부(`true`면 pyannote가 unknown으로 떨어져 기본 화자를 사용). |
 
 ### 참고 – Sync 단계 메타데이터
 
 `/sync`는 `segments.json`을 입력으로 받아 각 wav를 타겟 길이에 맞게 타임스트레치한 다음 `interim/<job_id>/text/vid/tts/synced/segments_synced.json`을 만듭니다. 이 파일은 길이 비율, 패딩/무음 보정, 사용한 백엔드(`stretch_backend`) 등을 추가하며, 상위 단계 메타데이터에 전적으로 의존합니다.
 
+- `issues.q.sync`는 원본 길이 대비 동기화 결과 길이 차이를 정수 %로 기록합니다(예: `-18`은 18% 짧음을 의미).
+- `issues.spk`는 STT 단계에서 화자 라벨을 찾지 못해 기본 화자(`SPEAKER_00`)로 대체했는지 여부를 나타냅니다.
+
 ---
 
 위 표를 따르면 사용자에게 노출되는 어떤 산출물도 compact STT 아카이브까지 추적할 수 있고, 번역/음성 합성 단계에서 필요한 매개변수나 override 포인트도 정확히 파악할 수 있습니다.
+
+
