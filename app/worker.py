@@ -186,13 +186,17 @@ def _strip_voice_samples_prefix(value: str) -> str:
     return key.lstrip("/")
 
 
-def _ensure_voice_library_index(language: str) -> Path | None:
+# Voice sample metadata is mirrored from S3; refresh before touching the local cache
+# so future DB migrations have a single integration point.
+def _ensure_voice_library_index(
+    language: str, force_refresh: bool = False
+) -> Path | None:
     lang_slug = normalize_lang_code(language) or "misc"
     lang_dir = VOICE_SAMPLES_EMBED_DIR / lang_slug
     lang_dir.mkdir(parents=True, exist_ok=True)
     local_path = lang_dir / f"{lang_slug}.json"
     remote_key = f"voice-samples/embedding/{lang_slug}/{lang_slug}.json"
-    if not local_path.is_file():
+    if force_refresh or not local_path.is_file():
         download_from_s3(VOICE_LIBRARY_BUCKET, remote_key, local_path)
     return local_path if local_path.is_file() else None
 
@@ -491,6 +495,7 @@ def _materialize_voice_replacements(
         elif entry.sample_key:
             bucket = entry.sample_bucket or default_bucket
             local_path = asset_dir / f"{speaker}_{entry.voice_id}.wav"
+            # Voice replacement clips live in S3; download locally when preparing overrides.
             if not download_from_s3(bucket, entry.sample_key, local_path):
                 logging.warning(
                     "Failed to download voice replacement sample %s from s3://%s/%s",
@@ -533,7 +538,7 @@ def _maybe_prepare_voice_replacements(
         diagnostics["reason"] = "missing_embeddings"
         return {}, diagnostics
 
-    _ensure_voice_library_index(target_lang)
+    _ensure_voice_library_index(target_lang, force_refresh=True)
     library = load_voice_library(target_lang, VOICE_SAMPLES_EMBED_DIR)
     if not library:
         diagnostics["reason"] = "library_unavailable"
@@ -1358,6 +1363,7 @@ def _handle_test_synthesis(job_details: dict):
         vocals_path = Path(demucs_result["vocals"])
 
         sample_label = voice_sample_id or f"voice_{uuid.uuid4().hex[:10]}"
+        # Voice sample audio itself is persisted to S3 so other workers can reuse it.
         sample_s3_key = f"voice-samples/samples/{sample_lang_code}/{sample_label}.wav"
         if not upload_to_s3(VOICE_LIBRARY_BUCKET, sample_s3_key, vocals_path):
             logging.warning(
@@ -1390,6 +1396,8 @@ def _handle_test_synthesis(job_details: dict):
                 # prompt_text는 아직 없으므로 빈 문자열로 1차 저장
                 "prompt_text": "",
             }
+            # Always pull the freshest S3-backed library index before mutating it.
+            _ensure_voice_library_index(sample_lang_code, force_refresh=True)
             local_index = update_voice_library_entry(
                 sample_lang_code,
                 base_library_entry,
@@ -1398,6 +1406,7 @@ def _handle_test_synthesis(job_details: dict):
             embedding_s3_key = (
                 f"voice-samples/embedding/{sample_lang_code}/{sample_lang_code}.json"
             )
+            # Voice sample metadata (JSON index) is synced back to S3 for sharing.
             if upload_to_s3(VOICE_LIBRARY_BUCKET, embedding_s3_key, local_index):
                 logging.info(
                     "Voice library index uploaded to s3://%s/%s",
@@ -1431,12 +1440,15 @@ def _handle_test_synthesis(job_details: dict):
             if base_library_entry is not None:
                 full_entry = dict(base_library_entry)
                 full_entry["prompt_text"] = prompt_text
+                # Reload S3 metadata again to merge with any concurrent updates.
+                _ensure_voice_library_index(sample_lang_code, force_refresh=True)
                 local_index = update_voice_library_entry(
                     sample_lang_code,
                     full_entry,
                     base_dir=VOICE_SAMPLES_EMBED_DIR,
                 )
                 if embedding_s3_key:
+                    # Persist the enriched metadata to S3 so other runtimes stay in sync.
                     if upload_to_s3(
                         VOICE_LIBRARY_BUCKET, embedding_s3_key, local_index
                     ):

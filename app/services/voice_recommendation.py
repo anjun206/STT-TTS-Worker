@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Sequence
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+_S3_CLIENT: Any | None = None
 
 
 def _default_library_index() -> Path:
@@ -29,6 +33,109 @@ def _default_library_root() -> Path:
 
 def _normalize_lang(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _resolve_local_library_path(
+    language: str | None, index_path: Path | None
+) -> Path:
+    root = index_path or _default_library_root()
+    if root.is_dir():
+        lang_slug = _normalize_lang(language) or "default"
+        candidate = root / lang_slug / f"{lang_slug}.json"
+        if not candidate.is_file():
+            alt_candidate = root / f"{lang_slug}.json"
+            return alt_candidate if alt_candidate.is_file() else candidate
+        return candidate
+    return root if root.is_file() else _default_library_index()
+
+
+def _get_s3_client():
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        region = os.getenv("AWS_REGION")
+        kwargs = {"region_name": region} if region else {}
+        _S3_CLIENT = boto3.client("s3", **kwargs)
+    return _S3_CLIENT
+
+
+def _library_s3_candidates(language: str | None) -> list[str]:
+    lang_slug = _normalize_lang(language) or "default"
+    candidates = [
+        f"voice-samples/embedding/{lang_slug}/{lang_slug}.json",
+        f"voice-samples/embedding/{lang_slug}.json",
+    ]
+    if lang_slug != "default":
+        candidates.append("voice-samples/embedding/default/default.json")
+        candidates.append("voice-samples/embedding/default.json")
+    # Preserve order but remove duplicates
+    seen = set()
+    ordered: list[str] = []
+    for key in candidates:
+        if key not in seen:
+            ordered.append(key)
+            seen.add(key)
+    return ordered
+
+
+def _load_library_payload_from_s3(
+    language: str | None,
+) -> tuple[Any | None, str | None]:
+    bucket = os.getenv("VOICE_LIBRARY_BUCKET") or os.getenv("AWS_S3_BUCKET")
+    if not bucket:
+        return None, None
+    candidates = _library_s3_candidates(language)
+    if not candidates:
+        return None, None
+    try:
+        client = _get_s3_client()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Unable to create S3 client for voice library: %s", exc)
+        return None, None
+
+    for key in candidates:
+        try:
+            response = client.get_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            if error_code in {"NoSuchKey", "404"}:
+                continue
+            logger.warning(
+                "Failed to fetch voice library from s3://%s/%s: %s",
+                bucket,
+                key,
+                exc,
+            )
+            return None, None
+        except BotoCoreError as exc:
+            logger.warning(
+                "Failed to fetch voice library from s3://%s/%s: %s", bucket, key, exc
+            )
+            return None, None
+
+        body = response.get("Body")
+        if body is None:
+            continue
+        try:
+            raw = body.read()
+        finally:
+            body.close()
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Voice library payload at s3://%s/%s is invalid JSON: %s",
+                bucket,
+                key,
+                exc,
+            )
+            continue
+
+        logger.info("Loaded voice library from s3://%s/%s", bucket, key)
+        return payload, f"s3://{bucket}/{key}"
+
+    logger.info("Voice library not found in S3 bucket %s for %s", bucket, language)
+    return None, None
 
 
 def _to_vector(values: Any) -> np.ndarray | None:
@@ -119,28 +226,21 @@ def load_voice_library(
     language: str | None = None, index_path: Path | None = None
 ) -> list[VoiceLibraryEntry]:
     """Load the target-language voice library metadata."""
-    root = index_path or _default_library_root()
-    if root.is_dir():
-        lang_slug = _normalize_lang(language) or "default"
-        candidate = root / lang_slug / f"{lang_slug}.json"
-        if not candidate.is_file():
-            alt_candidate = root / f"{lang_slug}.json"
-            path = alt_candidate if alt_candidate.is_file() else candidate
-        else:
-            path = candidate
-    else:
-        path = root if root.is_file() else _default_library_index()
+    payload, source = _load_library_payload_from_s3(language)
+    path: Path | None = None
+    if payload is None:
+        path = _resolve_local_library_path(language, index_path)
+        if not path.is_file():
+            logger.info("Voice library index not found at %s", path)
+            return []
 
-    if not path.is_file():
-        logger.info("Voice library index not found at %s", path)
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to read voice library %s: %s", path, exc)
-        return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read voice library %s: %s", path, exc)
+            return []
+        source = str(path)
 
     entries: list[VoiceLibraryEntry] = []
     raw_entries: Iterable[Any]
@@ -163,7 +263,8 @@ def load_voice_library(
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Skipping invalid voice entry: %s", exc)
-    logger.info("Loaded %d voice library entries from %s", len(entries), path)
+    location = source or (str(path) if path else "unknown")
+    logger.info("Loaded %d voice library entries from %s", len(entries), location)
     return entries
 
 
