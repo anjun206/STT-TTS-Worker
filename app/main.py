@@ -137,9 +137,17 @@ def _prepare_voice_replacements_local(paths, target_lang: str):
         diagnostics["reason"] = "no_matches"
         return overrides, diagnostics
     matches_summary: dict[str, dict] = {}
+    failures: dict[str, dict] = {}
     for speaker, plan in replacements.items():
         sample_path = _resolve_local_voice_sample(plan.entry.sample_key)
         if not sample_path or not sample_path.is_file():
+            failures[speaker] = {
+                "reason": "local_file_not_found",
+                "expected_path": str(sample_path) if sample_path else "None",
+                "voice_id": plan.entry.voice_id,
+                "sample_key": plan.entry.sample_key,
+                "message": f"Voice replacement sample for {plan.entry.voice_id} not found at {sample_path if sample_path else 'resolved path'}",
+            }
             continue
         overrides[speaker] = {
             "audio_path": str(sample_path),
@@ -152,11 +160,35 @@ def _prepare_voice_replacements_local(paths, target_lang: str):
         matches_summary[speaker] = plan.summary()
     if not overrides:
         diagnostics["reason"] = "materialization_failed"
+        # 실패한 화자들의 상세 정보 추가
+        if failures:
+            diagnostics["materialization_failures"] = failures
+            # 실패 원인별 통계
+            failure_reasons = {}
+            for speaker, failure_info in failures.items():
+                reason = failure_info.get("reason", "unknown")
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+            diagnostics["failure_summary"] = {
+                "total_failures": len(failures),
+                "failure_reasons": failure_reasons,
+            }
         return overrides, diagnostics
     diagnostics["enabled"] = True
     diagnostics["reason"] = "ok"
     diagnostics["matches"] = matches_summary
     diagnostics["prepared_speakers"] = sorted(overrides.keys())
+
+    # 일부는 성공하고 일부는 실패한 경우에도 실패 정보 기록
+    if failures:
+        diagnostics["materialization_failures"] = failures
+        diagnostics["failure_summary"] = {
+            "total_failures": len(failures),
+            "failure_reasons": {
+                reason: sum(1 for f in failures.values() if f.get("reason") == reason)
+                for reason in set(f.get("reason", "unknown") for f in failures.values())
+            },
+        }
+
     return overrides, diagnostics
 
 

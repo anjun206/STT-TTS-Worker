@@ -287,9 +287,43 @@ def _select_voice_sample(
             return path, override_ref
     ref = speaker_refs.get(speaker)
     if not ref:
-        raise FileNotFoundError(
-            f"No self-reference audio prepared for speaker {speaker}."
-        )
+        # 폴백: 사용 가능한 다른 화자의 샘플 사용
+        if speaker_refs:
+            # 화자 번호가 비슷한 것을 우선 선택, 없으면 첫 번째 사용
+            available_speakers = sorted(speaker_refs.keys())
+            fallback_speaker = None
+
+            # 같은 번호 패턴 찾기 (예: SPEAKER_04 -> SPEAKER_01, SPEAKER_02 중 선택)
+            try:
+                speaker_num = int(speaker.split("_")[-1]) if "_" in speaker else None
+                if speaker_num is not None:
+                    # 가장 가까운 번호의 화자 선택
+                    closest = min(
+                        available_speakers,
+                        key=lambda s: abs(
+                            int(s.split("_")[-1]) - speaker_num
+                            if "_" in s
+                            else float("inf")
+                        ),
+                    )
+                    fallback_speaker = closest
+            except (ValueError, IndexError):
+                pass
+
+            # 폴백 화자를 찾지 못했으면 첫 번째 사용 가능한 화자 사용
+            if not fallback_speaker:
+                fallback_speaker = available_speakers[0]
+
+            ref = speaker_refs[fallback_speaker]
+            logger.warning(
+                f"No self-reference audio for speaker {speaker}, "
+                f"using fallback speaker {fallback_speaker}"
+            )
+        else:
+            raise FileNotFoundError(
+                f"No self-reference audio prepared for speaker {speaker} "
+                f"and no fallback available."
+            )
     path = ref.audio_path
     if not path.is_file():
         raise FileNotFoundError(
